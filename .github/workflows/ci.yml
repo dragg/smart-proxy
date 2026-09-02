@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (PostgreSQL)
+    runs-on: ubuntu-latest
+
+    # Postgres is the production backend. The suite defaults to SQLite, which
+    # silently skips the backend-specific tests (BIGINT counters, the
+    # connection breaker, session upserts) -- exactly the ones that have
+    # broken in production. CI therefore runs against real Postgres only, and
+    # fails if anything skips.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: smart_proxy_tests
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          # Pinned on purpose: without it uv silently takes whatever Python the
+          # runner image ships (3.12.3 at the time of writing), so the version
+          # under test drifts with the image. Keep in step with .python-version.
+          python-version: "3.14"
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Run the suite against PostgreSQL
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/smart_proxy_tests
+        run: |
+          set -o pipefail
+          uv run --locked pytest -q -rs | tee pytest.log
+          if grep -qE '[0-9]+ skipped' pytest.log; then
+            echo "::error::tests skipped on the PostgreSQL leg -- every test must run here"
+            exit 1
+          fi
+
+  build:
+    name: Build (wheel + dashboard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          # Pinned on purpose: without it uv silently takes whatever Python the
+          # runner image ships (3.12.3 at the time of writing), so the version
+          # under test drifts with the image. Keep in step with .python-version.
+          python-version: "3.14"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the dashboard SPA
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # The SPA output (src/smart_proxy/static/app/) is gitignored on purpose, so
+      # hatchling leaves it out of the wheel and `pip install .` serves /_app/
+      # as 503. Editable installs are the supported path -- see the README.
+      # This step only proves the package still builds.
+      - name: Build the wheel (smoke test)
+        run: uv build --wheel

@@ -1,0 +1,41 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Secrets and local state. Never commit any of these: the database and the
+# json exports hold live Anthropic OAuth tokens, and .env holds DATABASE_URL,
+# the Telegram bot token and the reload key.
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.bak*
+/oauth*.json
+gpt.txt
+*.pem
+*.gz
+
+# Capture tooling output -- unredacted requests, including bearer tokens.
+anthropic-proxy-test/captures/
+anthropic-proxy-test/mitm-captures/
+anthropic-proxy-test/raw-debug/
+anthropic-proxy-test/oauth.json
+anthropic-proxy-test/keychain_backup.json
+anthropic-proxy-test/.claude/
+
+# Agent tooling (local, not part of the project)
+.claude/
+.superpowers/
+
+.DS_Store
+
+# Frontend
+web/node_modules/
+web/dist/
+src/smart_proxy/static/app/
+.pytest_cache/

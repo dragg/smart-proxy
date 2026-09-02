@@ -1,0 +1,83 @@
+:root {
+  --ink: #111827; --muted: #6b7280; --line: #e5e7eb; --bg: #f9fafb;
+  --accent: #111827;
+}
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0; color: var(--ink); }
+header { display: flex; align-items: center; gap: 24px;
+  padding: 14px 24px; border-bottom: 1px solid var(--line); }
+nav button { border: 0; background: none; padding: 8px 10px; cursor: pointer;
+  color: var(--muted); font-size: 14px; }
+nav button.active { color: var(--ink); font-weight: 600; }
+main { padding: 24px; }
+.pad { padding: 24px; }
+.err { color: #b91c1c; }
+.warn {
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: .6rem .7rem;
+  font-size: .85rem;
+  line-height: 1.4;
+  max-width: 34rem;
+}
+.warn code { background: #fef3c7; padding: 0 .2rem; border-radius: 3px; }
+.login { max-width: 320px; margin: 80px auto; display: grid; gap: 12px; }
+input { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; }
+button.primary, .login button { padding: 9px 14px; border: 0; border-radius: 6px;
+  background: var(--accent); color: #fff; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+th, td { border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: right;
+  font-variant-numeric: tabular-nums; }
+th:first-child, td:first-child { text-align: left; }
+th { background: var(--bg); font-size: 12px; text-transform: uppercase; color: var(--muted); }
+tr.model td:first-child { padding-left: 28px; color: var(--muted); }
+pre { background: var(--bg); padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; }
+/* Bound chart height — Chart.js responsive mode ignores the canvas height
+   attribute and would otherwise grow to width/aspectRatio (huge on wide screens). */
+.chart-wrap { position: relative; height: 240px; margin: 16px 0; }
+/* Date-range presets + key-create toolbar */
+.presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.presets button { padding: 6px 10px; border: 1px solid #d1d5db; background: #fff;
+  border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--ink); }
+.create, .toolbar { display: flex; gap: 10px; align-items: center;
+  flex-wrap: wrap; margin: 4px 0 12px; }
+.created { background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 6px;
+  padding: 10px 12px; margin: 12px 0; display: flex; gap: 10px; align-items: center;
+  flex-wrap: wrap; }
+.created code { background: #fff; padding: 3px 7px; border-radius: 4px;
+  border: 1px solid var(--line); user-select: all; font-size: 13px; }
+.created button, .toolbar button:not(.primary) { padding: 6px 10px; border: 1px solid #d1d5db;
+  background: #fff; border-radius: 6px; cursor: pointer; font-size: 13px; }
+/* OAuth seven_day history section */
+h2 { font-size: 15px; margin: 28px 0 8px; }
+h3 { font-size: 14px; margin: 18px 0 6px; font-weight: 600; }
+.muted { color: var(--muted); font-weight: 400; }
+/* Windows tab: window-kind (5h/7d) + Starts At / Period mode toggles */
+.toggles { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 4px 0 8px; }
+.toggles .modes { margin: 0; }
+.modes { display: inline-flex; gap: 0; margin: 4px 0 8px; border: 1px solid #d1d5db;
+  border-radius: 6px; overflow: hidden; }
+.modes button { padding: 6px 12px; border: 0; background: #fff; cursor: pointer;
+  font-size: 13px; color: var(--muted); }
+.modes button + button { border-left: 1px solid #d1d5db; }
+.modes button.active { background: var(--accent); color: #fff; }
+.raw { margin-top: 24px; }
+.raw summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 4px 0; }
+
+/* Undeclared limit wipes: a weekly counter zeroed while its resets_at held. */
+.wiped {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.wipes { margin: 8px 0 24px; }
+.wipes summary { cursor: pointer; color: #92400e; font-size: 13px; padding: 4px 0; }
+.nowpct { color: var(--muted); white-space: nowrap; }
