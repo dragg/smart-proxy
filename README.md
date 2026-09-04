@@ -278,6 +278,11 @@ to your host.
    ExecStart=/home/USER/smart-proxy/.venv/bin/python -m smart_proxy anthropic-proxy
    Restart=on-failure
    RestartSec=5
+   # A restart drains rather than drops: on SIGTERM the proxy stops accepting
+   # connections and finishes the turns already running, for up to
+   # ANTHROPIC_PROXY_SHUTDOWN_TIMEOUT_SECONDS. Keep this larger than that value
+   # -- systemd's own default is 90 s and would SIGKILL mid-turn.
+   TimeoutStopSec=240
 
    [Install]
    WantedBy=multi-user.target

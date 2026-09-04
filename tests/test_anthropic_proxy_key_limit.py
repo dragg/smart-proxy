@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
 from aiohttp.test_utils import make_mocked_request
 
 from smart_proxy import anthropic_proxy
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
 from smart_proxy.key_limits import LimitBlock
 
 
@@ -33,7 +34,12 @@ class LimitGateTests(unittest.IsolatedAsyncioTestCase):
         pool.pick.side_effect = AssertionError("pool must not be consulted when blocked")
         limiter = MagicMock()
         limiter.check.return_value = block
-        return {"anthropic_pool": pool, "http_client": MagicMock(), "key_limiter": limiter}
+        return {
+            "anthropic_pool": pool,
+            "http_client": MagicMock(),
+            "key_limiter": limiter,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
+        }
 
     async def test_over_limit_returns_429_with_smartproxy_message(self):
         block = LimitBlock(kind="daily_usd", label="24h", retry_after=3554,
@@ -225,6 +231,7 @@ class SpendAddedOnSuccessTests(unittest.IsolatedAsyncioTestCase):
         limiter.check.return_value = None
         app = {
             "anthropic_pool": pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": client,
             "usage_tracker": tracker,
             "key_limiter": limiter,

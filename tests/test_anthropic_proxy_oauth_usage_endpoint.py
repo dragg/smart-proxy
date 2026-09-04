@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from aiohttp.test_utils import make_mocked_request
 
 from smart_proxy import anthropic_proxy
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
 from smart_proxy.anthropic_proxy import AnthropicKeyPool, _oauth_usage_handler
 
 
@@ -41,6 +42,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
         mock_pool.check_auth.return_value = False
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": MagicMock(),
             "db": MagicMock(),
             "oauth_usage_require_auth": True,
@@ -66,6 +68,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": MagicMock(),
             "db": mock_db,
         }
@@ -84,6 +87,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
         mock_pool.ensure_valid_token = AsyncMock()
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": MagicMock(),
             "db": mock_db,
         }
@@ -113,6 +117,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -160,6 +165,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -186,6 +192,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -218,6 +225,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
             "oauth_usage_cache_seconds": 60,
@@ -257,6 +265,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
             "oauth_usage_cache_seconds": 60,
@@ -298,6 +307,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
             "oauth_usage_cache_seconds": 60,
@@ -349,6 +359,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -389,6 +400,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -421,6 +433,7 @@ class OauthUsageEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": mock_pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": mock_client,
             "db": mock_db,
         }
@@ -502,6 +515,7 @@ class SmartProxyLimitHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         app = {
             "anthropic_pool": pool,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "http_client": MagicMock(),
             "db": MagicMock(),
             "key_limiter": limiter,
@@ -532,6 +546,7 @@ class SmartProxyLimitHandlerTests(unittest.IsolatedAsyncioTestCase):
         pool.is_proxy_key.return_value = False
         app = {
             "anthropic_pool": pool, "http_client": MagicMock(), "db": MagicMock(),
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "key_limiter": MagicMock(), "oauth_usage_cache_seconds": 0,
         }
         built = [{"id": "k1", "usage": {"limits": []}}]

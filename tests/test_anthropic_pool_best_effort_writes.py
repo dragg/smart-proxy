@@ -25,6 +25,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from smart_proxy import anthropic_proxy
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
 from smart_proxy.anthropic_proxy import _AnthropicKey, AnthropicKeyPool
 from smart_proxy.db import DbUnavailable
 from smart_proxy.notifier import AlertThrottle
@@ -148,6 +149,7 @@ class DeadDbEndToEndTests(unittest.IsolatedAsyncioTestCase):
             "disable_1m_context": False,
             "strip_system_phrase": "",
             "claude_like": False,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "db": _DeadDb(),
             "key_limiter": None,
             "_notifier": self.notifier,

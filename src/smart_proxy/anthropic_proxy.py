@@ -34,6 +34,13 @@ from zoneinfo import ZoneInfo
 import httpx
 from aiohttp import web
 
+from smart_proxy.claude_code_identity import (
+    DEFAULT_CLAUDE_CODE_VERSION,
+    ClaudeCodeVersion,
+    render_billing_header,
+    render_cli_user_agent,
+    render_code_user_agent,
+)
 from smart_proxy.anthropic_oauth import (
     CLAUDE_OAUTH_CLIENT_ID,
     OAuthRefreshError,
@@ -1642,11 +1649,9 @@ async def _record_anthropic_event(
 # Proxy handler
 # ---------------------------------------------------------------------------
 
-_BILLING_HEADER = (
-    "x-anthropic-billing-header: "
-    "cc_version=2.1.92.a35; cc_entrypoint=sdk-cli; cch=00000;"
-)
-_CLAUDE_LIKE_USER_AGENT = "claude-cli/2.1.92 (external, cli)"
+# The Claude Code version behind every fingerprint below is not pinned here —
+# it lives in app["claude_code_version"] and is rendered per request. See
+# smart_proxy.claude_code_identity for why (Anthropic gates models on it).
 _CLAUDE_LIKE_BETA_BASE = (
     "interleaved-thinking-2025-05-14,"
     "redact-thinking-2026-02-12,"
@@ -1654,9 +1659,17 @@ _CLAUDE_LIKE_BETA_BASE = (
     "prompt-caching-scope-2026-01-05,"
     "claude-code-20250219"
 )
+# Captured from a real Claude Code 2.1.260. These track the SDK and Node that
+# the CLI bundles — an axis independent of the Claude Code version above, not
+# derivable from it, so they are not rendered from it and must not be folded
+# into its learning. Unlike cc_version they are cosmetic: upstream accepts a
+# gated model with these stale, nonsensical, or absent entirely (measured
+# 2026-09-04, on the same request where an old cc_version still returned 400).
+# So they may drift without breaking anything; refresh them only to keep the
+# fingerprint coherent, by capturing a current CLI request.
 _CLAUDE_LIKE_HEADER_OVERRIDES = {
-    "X-Stainless-Package-Version": "0.80.0",
-    "X-Stainless-Runtime-Version": "v24.3.0",
+    "X-Stainless-Package-Version": "0.112.1",
+    "X-Stainless-Runtime-Version": "v26.3.0",
     "Accept-Encoding": "gzip, deflate, br, zstd",
 }
 _CLAUDE_LIKE_STRIP_HEADERS = (
@@ -1745,7 +1758,9 @@ def _pop_header(headers: dict[str, str], target: str) -> None:
         headers.pop(key, None)
 
 
-def _apply_claude_like_headers(headers: dict[str, str]) -> dict[str, str]:
+def _apply_claude_like_headers(
+    headers: dict[str, str], claude_code_version: str
+) -> dict[str, str]:
     merged = dict(headers)
     for header in _CLAUDE_LIKE_STRIP_HEADERS:
         _pop_header(merged, header)
@@ -1756,7 +1771,9 @@ def _apply_claude_like_headers(headers: dict[str, str]) -> dict[str, str]:
 
     user_agent = (_get_header_value(merged, "User-Agent") or "").strip()
     if not user_agent.startswith("claude-cli/"):
-        _set_header_value(merged, "User-Agent", _CLAUDE_LIKE_USER_AGENT)
+        _set_header_value(
+            merged, "User-Agent", render_cli_user_agent(claude_code_version)
+        )
 
     if not ((_get_header_value(merged, "X-Claude-Code-Session-Id") or "").strip()):
         _set_header_value(merged, "X-Claude-Code-Session-Id", str(uuid4()))
@@ -1876,8 +1893,13 @@ def _strip_system_phrase(body: bytes, phrase: str) -> bytes:
     return json.dumps(data, separators=(",", ":")).encode()
 
 
-def _inject_billing_header(body: bytes) -> bytes:
-    """Prepend Claude Code billing header to the system prompt."""
+def _inject_billing_header(body: bytes, claude_code_version: str) -> bytes:
+    """Prepend Claude Code billing header to the system prompt.
+
+    Anthropic reads the model version gate out of this block, so the version it
+    carries decides whether gated models answer at all for clients that don't
+    send a block of their own.
+    """
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, ValueError):
@@ -1885,7 +1907,7 @@ def _inject_billing_header(body: bytes) -> bytes:
     if not isinstance(data, dict):
         return body
 
-    billing = {"type": "text", "text": _BILLING_HEADER}
+    billing = {"type": "text", "text": render_billing_header(claude_code_version)}
     system = data.get("system")
 
     def _has_billing(items: list) -> bool:
@@ -2202,6 +2224,7 @@ def _apply_oauth_headers(
     headers: dict[str, str],
     token: str,
     *,
+    claude_code_version: str,
     disable_1m_context: bool = False,
     claude_like: bool = False,
 ) -> dict[str, str]:
@@ -2215,7 +2238,7 @@ def _apply_oauth_headers(
             if beta_key is not None:
                 merged.pop(beta_key, None)
     if claude_like:
-        merged = _apply_claude_like_headers(merged)
+        merged = _apply_claude_like_headers(merged, claude_code_version)
     merged["Authorization"] = f"Bearer {token}"
     _set_header_value(
         merged,
@@ -2224,7 +2247,7 @@ def _apply_oauth_headers(
     )
     _setdefault_header(merged, "anthropic-version", "2023-06-01")
     _setdefault_header(merged, "anthropic-dangerous-direct-browser-access", "true")
-    _setdefault_header(merged, "User-Agent", "claude-cli/2.1.89 (external, sdk-cli)")
+    _setdefault_header(merged, "User-Agent", render_cli_user_agent(claude_code_version))
     _setdefault_header(merged, "x-app", "cli")
     return merged
 
@@ -2233,6 +2256,7 @@ def _build_oauth_smoke_request(
     client: httpx.AsyncClient,
     token: str,
     *,
+    claude_code_version: str,
     disable_1m_context: bool = False,
     claude_like: bool = False,
 ):
@@ -2244,10 +2268,11 @@ def _build_oauth_smoke_request(
         },
         separators=(",", ":"),
     ).encode()
-    body = _inject_billing_header(body)
+    body = _inject_billing_header(body, claude_code_version)
     headers = _apply_oauth_headers(
         {},
         token,
+        claude_code_version=claude_code_version,
         disable_1m_context=disable_1m_context,
         claude_like=claude_like,
     )
@@ -2842,6 +2867,16 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
         request, req_body, usage_proxy_key, limiter
     )
 
+    # A real Claude Code CLI states its version twice — in the User-Agent and in
+    # the billing block it puts first in the system prompt. Harvest it here, but
+    # adopt it only once upstream has accepted this very request (below), so the
+    # proxy never starts claiming a version Anthropic would reject. Read-only:
+    # req_body is not mutated, so classification and admission are unaffected.
+    cc_version: ClaudeCodeVersion = request.app["claude_code_version"]
+    cc_version_candidate = cc_version.candidate(
+        user_agent=request.headers.get("User-Agent"), req_body=req_body
+    )
+
     max_attempts = max(len(pool._keys), 3)
     attempt_failures: list[_AttemptFailure] = []
     tried_key_ids: set[str] = set()
@@ -2940,11 +2975,12 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
             fwd = _apply_oauth_headers(
                 fwd,
                 effective_token,
+                claude_code_version=cc_version.token,
                 disable_1m_context=bool(request.app.get("disable_1m_context")),
                 claude_like=bool(request.app.get("claude_like")),
             )
             if "/v1/messages" in path:
-                attempt_body = _inject_billing_header(attempt_body)
+                attempt_body = _inject_billing_header(attempt_body, cc_version.token)
                 if "beta=true" not in (qs or ""):
                     attempt_url = f"{UPSTREAM_BASE}{path}?beta=true"
                     if qs:
@@ -3045,6 +3081,14 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
                 )
             )
             continue
+
+        # Upstream accepted the request, so the version it carried is one
+        # Anthropic honours right now — the only endorsement worth adopting.
+        # Checked as an explicit 2xx: a 400 (e.g. claude_code_version_too_old)
+        # is not filtered above and reaches this point on its way to the client.
+        if cc_version_candidate is not None and 200 <= r.status_code < 300:
+            cc_version.commit(cc_version_candidate)
+            cc_version_candidate = None
 
         # Success path: stream response back to client
         is_stream = "text/event-stream" in (
@@ -3271,7 +3315,6 @@ async def _health(_: web.Request) -> web.Response:
     return web.Response(text="ok\n", content_type="text/plain")
 
 
-_OAUTH_USAGE_UA = "claude-code/2.1.90"
 _OAUTH_USAGE_BETA = "oauth-2025-04-20"
 
 
@@ -3650,6 +3693,7 @@ async def _build_oauth_usage_payload(
     client: httpx.AsyncClient,
     db: Database,
     *,
+    claude_code_version: str,
     include_inactive_oauth: bool = False,
 ) -> tuple[list[dict], dict | None]:
     rows = await db.list_anthropic_keys()
@@ -3664,7 +3708,7 @@ async def _build_oauth_usage_payload(
     usage_url = f"{UPSTREAM_BASE}/api/oauth/usage"
     usage_headers = {
         "Accept": "application/json, text/plain, */*",
-        "User-Agent": _OAUTH_USAGE_UA,
+        "User-Agent": render_code_user_agent(claude_code_version),
         "anthropic-beta": _OAUTH_USAGE_BETA,
     }
 
@@ -3846,6 +3890,7 @@ async def _oauth_usage_handler(request: web.Request) -> web.Response:
             pool,
             client,
             db,
+            claude_code_version=request.app["claude_code_version"].token,
             include_inactive_oauth=include_inactive_oauth,
         )
         payload = {
@@ -3880,6 +3925,7 @@ async def _oauth_usage_handler(request: web.Request) -> web.Response:
             pool,
             client,
             db,
+            claude_code_version=request.app["claude_code_version"].token,
             include_inactive_oauth=include_inactive_oauth,
         )
         generated_at = _utc_now_iso()
@@ -4355,8 +4401,18 @@ async def _reload_handler(request: web.Request) -> web.Response:
         )
     await pool.reload()
     await _resync_limiter(request.app)
+    cc_version: ClaudeCodeVersion = request.app["claude_code_version"]
+    # ?reset_claude_code_version=1 drops a learned version back to the configured
+    # floor — the operator's escape hatch when a newer version misbehaves and
+    # lowering the floor alone would be overridden by what the proxy learned.
+    if request.query.get("reset_claude_code_version"):
+        cc_version.reset()
     return web.Response(
-        text=json.dumps({"status": "reloaded", "active": pool.available}) + "\n",
+        text=json.dumps({
+            "status": "reloaded",
+            "active": pool.available,
+            "claude_code_version": cc_version.token,
+        }) + "\n",
         content_type="application/json",
     )
 
@@ -4632,6 +4688,9 @@ async def _run_oauth_smoke_pass(app: web.Application, window_name: str) -> None:
         req = _build_oauth_smoke_request(
             client,
             effective_token,
+            # Read live, not snapshotted at startup: the smoke check must claim
+            # whatever version the proxy has learned by now.
+            claude_code_version=app["claude_code_version"].token,
             disable_1m_context=disable_1m_context,
             claude_like=bool(app.get("claude_like")),
         )
@@ -4977,6 +5036,8 @@ def create_app(
     database_url: str = "",
     disable_1m_context: bool = False,
     claude_like: bool = False,
+    claude_code_version: str = DEFAULT_CLAUDE_CODE_VERSION,
+    claude_code_version_autolearn: bool = True,
     strip_system_phrase: str = "",
     upgrade_cache_ttl: bool = True,
     precommit_timeout_seconds: float = 10.0,
@@ -5014,6 +5075,11 @@ def create_app(
     app["oauth_login_redirect_port"] = oauth_login_redirect_port.strip()
     app["disable_1m_context"] = disable_1m_context
     app["claude_like"] = claude_like
+    # Raises on a malformed configured version, so the proxy refuses to start
+    # rather than rendering garbage into every upstream request.
+    app["claude_code_version"] = ClaudeCodeVersion(
+        claude_code_version, autolearn=claude_code_version_autolearn
+    )
     app["strip_system_phrase"] = strip_system_phrase
     app["upgrade_cache_ttl"] = upgrade_cache_ttl
     app["precommit_timeout"] = precommit_timeout_seconds
@@ -5089,6 +5155,8 @@ def main() -> None:
         database_url=settings.database_url,
         disable_1m_context=settings.anthropic_proxy_disable_1m_context,
         claude_like=settings.claude_like,
+        claude_code_version=settings.anthropic_proxy_claude_code_version,
+        claude_code_version_autolearn=settings.anthropic_proxy_claude_code_version_autolearn,
         strip_system_phrase=settings.anthropic_proxy_strip_system_phrase,
         upgrade_cache_ttl=settings.anthropic_proxy_upgrade_cache_ttl,
         precommit_timeout_seconds=settings.anthropic_proxy_precommit_timeout_seconds,
@@ -5115,7 +5183,15 @@ def main() -> None:
         "Anthropic proxy starting on 0.0.0.0:%s → %s",
         PROXY_PORT, UPSTREAM_BASE,
     )
-    web.run_app(app, host="0.0.0.0", port=PROXY_PORT, print=None)
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PROXY_PORT,
+        print=None,
+        # Drain rather than drop: connections stop being accepted at once, but
+        # handlers already running get this long to finish.
+        shutdown_timeout=settings.anthropic_proxy_shutdown_timeout_seconds,
+    )
 
 
 if __name__ == "__main__":

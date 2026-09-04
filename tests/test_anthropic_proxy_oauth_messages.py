@@ -15,9 +15,14 @@ import sys
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
+from smart_proxy.claude_code_identity import (
+    DEFAULT_CLAUDE_CODE_VERSION,
+    render_billing_header,
+    render_cli_user_agent,
+)
 from smart_proxy.anthropic_proxy import (
     _AnthropicKey,
-    _BILLING_HEADER,
     _extract_sse_error_details,
     _merge_beta_flags,
     _proxy_handler,
@@ -366,6 +371,7 @@ class AnthropicProxyOAuthMessagesTests(unittest.TestCase):
             "disable_1m_context": disable_1m_context,
             "strip_system_phrase": strip_system_phrase,
             "claude_like": claude_like,
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
             "db": db if db is not None else _FakeDb(),
             "key_limiter": key_limiter,
         }
@@ -532,11 +538,14 @@ class AnthropicProxyOAuthMessagesTests(unittest.TestCase):
             self.assertEqual(resp.status, 401)
             assert client.last_build is not None
             sent_headers = client.last_build["headers"]
-            self.assertEqual(sent_headers["User-Agent"], "claude-cli/2.1.92 (external, cli)")
+            self.assertEqual(
+                sent_headers["User-Agent"],
+                render_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION),
+            )
             self.assertEqual(sent_headers["x-app"], "cli")
             UUID(sent_headers["X-Claude-Code-Session-Id"])
-            self.assertEqual(sent_headers["X-Stainless-Package-Version"], "0.80.0")
-            self.assertEqual(sent_headers["X-Stainless-Runtime-Version"], "v24.3.0")
+            self.assertEqual(sent_headers["X-Stainless-Package-Version"], "0.112.1")
+            self.assertEqual(sent_headers["X-Stainless-Runtime-Version"], "v26.3.0")
             self.assertEqual(sent_headers["X-Stainless-Timeout"], "600")
             self.assertEqual(sent_headers["Accept-Encoding"], "gzip, deflate, br, zstd")
             self.assertEqual(
@@ -708,7 +717,7 @@ class AnthropicProxyOAuthMessagesTests(unittest.TestCase):
             forwarded = json.loads(client.last_build["content"])
             self.assertEqual(
                 forwarded["system"][0]["text"],
-                _BILLING_HEADER,
+                render_billing_header(f"{DEFAULT_CLAUDE_CODE_VERSION}.a35"),
             )
             self.assertEqual(forwarded["system"][1]["text"], "prefix  suffix")
             self.assertEqual(

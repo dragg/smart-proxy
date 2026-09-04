@@ -17,6 +17,7 @@ import sys
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
 from smart_proxy.anthropic_proxy import (
     AnthropicKeyPool,
     _PARIS_TZ,
@@ -432,6 +433,7 @@ class AnthropicProxyScheduleTests(unittest.TestCase):
                     app = {
                         "db": db,
                         "anthropic_pool": pool,
+                        "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                         "http_client": _FakeSmokeClient(
                             _FakeSmokeResponse(
                                 429,

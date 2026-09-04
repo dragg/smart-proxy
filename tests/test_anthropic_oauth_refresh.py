@@ -16,6 +16,11 @@ import sys
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
+from smart_proxy.claude_code_identity import (
+    DEFAULT_CLAUDE_CODE_VERSION,
+    render_cli_user_agent,
+)
 from smart_proxy.anthropic_proxy import (
     AnthropicKeyPool,
     TOKEN_URL,
@@ -350,6 +355,7 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                     app = {
                         "db": db,
                         "anthropic_pool": pool,
+                        "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                         "http_client": client,
                         "disable_1m_context": False,
                     }
@@ -410,6 +416,7 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                     app = {
                         "db": db,
                         "anthropic_pool": pool,
+                        "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                         "http_client": client,
                         "disable_1m_context": False,
                     }
@@ -479,6 +486,7 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                     app = {
                         "db": db,
                         "anthropic_pool": pool,
+                        "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                         "http_client": client,
                         "disable_1m_context": False,
                     }
@@ -531,6 +539,7 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                         "http_client": client,
                         "disable_1m_context": False,
                         "claude_like": True,
+                        "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                     }
 
                     await _run_oauth_smoke_pass(app, "midday")
@@ -539,7 +548,10 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                     self.assertIsNotNone(client.last_build)
                     assert client.last_build is not None
                     headers = client.last_build["headers"]
-                    self.assertEqual(headers["User-Agent"], "claude-cli/2.1.92 (external, cli)")
+                    self.assertEqual(
+                        headers["User-Agent"],
+                        render_cli_user_agent(DEFAULT_CLAUDE_CODE_VERSION),
+                    )
                     self.assertEqual(headers["x-app"], "cli")
                     UUID(headers["X-Claude-Code-Session-Id"])
                 finally:
@@ -575,7 +587,10 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                         }
                     )
 
-                    keys, last_failure = await _build_oauth_usage_payload(pool, client, db)
+                    keys, last_failure = await _build_oauth_usage_payload(
+                        pool, client, db,
+                        claude_code_version=DEFAULT_CLAUDE_CODE_VERSION,
+                    )
 
                     self.assertIsNone(last_failure)
                     self.assertEqual(len(keys), 1)
@@ -600,7 +615,10 @@ class AnthropicOAuthRefreshTests(unittest.TestCase):
                         scopes='["user:inference"]', name="stby", role="standby")
                     pool = AnthropicKeyPool(db); await pool.reload()
                     client = _FakeAsyncClient({"access_token": "new", "refresh_token": "nr", "expires_in": 28800})
-                    keys, _ = await _build_oauth_usage_payload(pool, client, db)
+                    keys, _ = await _build_oauth_usage_payload(
+                        pool, client, db,
+                        claude_code_version=DEFAULT_CLAUDE_CODE_VERSION,
+                    )
                     self.assertEqual(keys, [])                 # standby absent
                     self.assertEqual(len(client.calls), 0)     # no /token refresh for standby
                 finally:

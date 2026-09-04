@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from smart_proxy.claude_code_identity import DEFAULT_CLAUDE_CODE_VERSION
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -62,6 +64,18 @@ class Settings(BaseSettings):
     anthropic_proxy_openai_compat_cache_ttl: str = "1h"
     # Local timezone whose midnight starts the per-key spend-limit window.
     anthropic_proxy_limit_window_tz: str = "Europe/Paris"
+    # Claude Code version the proxy claims for clients that don't send their own
+    # billing block (SDKs, OpenAI-compat, smoke checks). Anthropic gates newer
+    # models on it, so a stale value 400s those models while the rest still work.
+    # This is a floor: real Claude Code traffic teaches the proxy newer versions.
+    anthropic_proxy_claude_code_version: str = DEFAULT_CLAUDE_CODE_VERSION
+    # Set false to pin to the floor exactly and ignore anything learned.
+    anthropic_proxy_claude_code_version_autolearn: bool = True
+    # On SIGTERM the proxy stops accepting connections and waits this long for
+    # requests already in flight. A single upstream call may run for 600 s, so
+    # aiohttp's own 60 s default cuts long turns in half. systemd's
+    # TimeoutStopSec must exceed this value or SIGKILL arrives first.
+    anthropic_proxy_shutdown_timeout_seconds: float = 180.0
 
     database_url: str = ""
     db_path: str = "./smart-proxy.db"

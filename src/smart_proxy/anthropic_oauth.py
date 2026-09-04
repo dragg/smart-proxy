@@ -13,6 +13,12 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 
+from smart_proxy.claude_code_identity import (
+    DEFAULT_CLAUDE_CODE_VERSION,
+    render_cli_user_agent,
+    render_code_user_agent,
+)
+
 # Claude Code / Claude.ai OAuth (PKCE) — same public client_id as CLI flows
 CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -30,6 +36,12 @@ DEFAULT_REFRESH_HEADERS: dict[str, str] = {
 }
 
 DEFAULT_ACTIVATION_BASE_URL = "https://api.anthropic.com"
+
+# Placeholders in _ACTIVATION_STEPS below, swapped for the caller's Claude Code
+# version in build_activation_requests. The steps are a module-level literal, so
+# the version cannot be baked in here.
+_CLI_UA = "\x00cli-ua\x00"
+_CODE_UA = "\x00code-ua\x00"
 
 _ACTIVATION_STEPS: list[tuple[str, str, bool, dict[str, str]]] = [
     (
@@ -51,7 +63,7 @@ _ACTIVATION_STEPS: list[tuple[str, str, bool, dict[str, str]]] = [
         {
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, compress, deflate, br",
-            "User-Agent": "claude-cli/2.1.90 (external, sdk-cli)",
+            "User-Agent": _CLI_UA,
             "anthropic-beta": "oauth-2025-04-20",
             "Connection": "keep-alive",
         },
@@ -63,7 +75,7 @@ _ACTIVATION_STEPS: list[tuple[str, str, bool, dict[str, str]]] = [
         {
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, compress, deflate, br",
-            "User-Agent": "claude-code/2.1.90",
+            "User-Agent": _CODE_UA,
             "anthropic-beta": "oauth-2025-04-20",
             "Connection": "keep-alive",
         },
@@ -87,7 +99,7 @@ _ACTIVATION_STEPS: list[tuple[str, str, bool, dict[str, str]]] = [
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, compress, deflate, br",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.90",
+            "User-Agent": _CODE_UA,
             "anthropic-beta": "oauth-2025-04-20",
             "Connection": "keep-alive",
         },
@@ -308,12 +320,17 @@ def build_activation_requests(
     *,
     base_url: str = DEFAULT_ACTIVATION_BASE_URL,
     access_token: str,
+    claude_code_version: str = DEFAULT_CLAUDE_CODE_VERSION,
 ) -> list[dict]:
     """Build exact OAuth activation requests captured from Claude traffic."""
     host = urlparse(base_url).netloc or "api.anthropic.com"
+    substitutions = {
+        _CLI_UA: render_cli_user_agent(claude_code_version),
+        _CODE_UA: render_code_user_agent(claude_code_version),
+    }
     reqs: list[dict] = []
     for method, path, needs_auth, extra_headers in _ACTIVATION_STEPS:
-        headers = dict(extra_headers)
+        headers = {k: substitutions.get(v, v) for k, v in extra_headers.items()}
         headers["Host"] = host
         if needs_auth:
             headers["Authorization"] = f"Bearer {access_token}"
@@ -334,10 +351,15 @@ async def activate_oauth_access_token(
     access_token: str,
     base_url: str = DEFAULT_ACTIVATION_BASE_URL,
     timeout: float = 20.0,
+    claude_code_version: str = DEFAULT_CLAUDE_CODE_VERSION,
 ) -> list[dict]:
     """Run post-refresh activation requests; raise if any request fails."""
     results: list[dict] = []
-    for req in build_activation_requests(base_url=base_url, access_token=access_token):
+    for req in build_activation_requests(
+        base_url=base_url,
+        access_token=access_token,
+        claude_code_version=claude_code_version,
+    ):
         resp = await client.request(
             req["method"],
             req["url"],

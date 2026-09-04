@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 
 from aiohttp.test_utils import make_mocked_request
 
+from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
 from smart_proxy.anthropic_proxy import (
     AnthropicKeyPool,
     _oauth_usage_handler,
@@ -71,6 +72,7 @@ class OauthWindowTrackingE2ETests(unittest.IsolatedAsyncioTestCase):
 
                 app = {
                     "anthropic_pool": mock_pool,
+                    "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
                     "http_client": mock_client,
                     "db": db,
                 }
