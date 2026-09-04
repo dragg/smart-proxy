@@ -33,8 +33,9 @@ from smart_proxy.db import Database, parse_allowed_proxy_keys
 from smart_proxy.key_limits import LIMIT_KINDS
 from smart_proxy.usage import build_price_lookup
 from smart_proxy.usage_dashboard import (
-    _usage_date_range,
+    _usage_range,
     build_sessions_json,
+    build_usage_bucket_series,
     build_usage_cost_json,
     build_usage_kind_json,
 )
@@ -172,32 +173,68 @@ async def _api_session(request: web.Request) -> web.Response:
 
 
 async def _api_usage(request: web.Request) -> web.Response:
+    """Per-key/model cost for a range.
+
+    ``YYYY-MM-DD`` bounds read usage_daily exactly as before; ``YYYY-MM-DDTHH``
+    bounds read usage_bucket and add a per-hour ``series`` plus ``covered_from``.
+    The grammar alone picks the source -- never how much data happens to exist.
+    """
     if not _dashboard_authorized(request):
         return _unauthorized()
-    date_range = _usage_date_range(request)
-    if isinstance(date_range, web.Response):
-        return date_range
-    start, end = date_range
+    rng = _usage_range(request)
+    if isinstance(rng, web.Response):
+        return rng
     db: Database | None = request.app.get("db")
     if db is None:
         return web.json_response({"error": "usage database unavailable"}, status=500)
-    rows = await db.query_usage_by_key_model(start, end)
     prices = build_price_lookup(await db.get_all_model_prices())
-    return web.json_response(build_usage_cost_json(start, end, rows, prices))
+
+    if rng.granularity == "day":
+        rows = await db.query_usage_by_key_model(rng.start, rng.end)
+        return web.json_response(build_usage_cost_json(rng.start, rng.end, rows, prices))
+
+    rows = await db.query_usage_bucket_by_key_model(rng.start, rng.end)
+    series_rows = await db.query_usage_bucket_series(rng.start, rng.end)
+    covered_from = await db.min_usage_bucket_hour()
+    return web.json_response(
+        build_usage_cost_json(
+            rng.start,
+            rng.end,
+            rows,
+            prices,
+            granularity="hour",
+            covered_from=covered_from,
+            series=build_usage_bucket_series(series_rows, prices, rng.start, rng.end),
+        )
+    )
 
 
 async def _api_usage_kinds(request: web.Request) -> web.Response:
+    """Per-request-kind cost for a range; same grammar as /api/usage.
+
+    Going through _usage_range also means a malformed range now 400s instead
+    of reaching SQL as a bind parameter and quietly matching nothing.
+    """
     if not _dashboard_authorized(request):
         return _unauthorized()
+    rng = _usage_range(request)
+    if isinstance(rng, web.Response):
+        return rng
     db: Database | None = request.app.get("db")
     if db is None:
         return web.json_response({"error": "database unavailable"}, status=500)
-    start = request.query.get("start", "")
-    end = request.query.get("end", "")
-    rows = await db.query_usage_by_kind(start, end)
+    if rng.granularity == "day":
+        rows = await db.query_usage_by_kind(rng.start, rng.end)
+    else:
+        rows = await db.query_usage_bucket_by_kind(rng.start, rng.end)
     prices = build_price_lookup(await db.get_all_model_prices())
     return web.json_response(
-        {"start": start, "end": end, "kinds": build_usage_kind_json(rows, prices)}
+        {
+            "granularity": rng.granularity,
+            "start": rng.start,
+            "end": rng.end,
+            "kinds": build_usage_kind_json(rows, prices),
+        }
     )
 
 

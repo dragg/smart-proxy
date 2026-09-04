@@ -515,6 +515,38 @@ POSTGRES_MIGRATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        # Hour-grain usage with the full usage_daily dimension set (+ request_kind),
+        # for the dashboard's arbitrary-window view. BIGINT counters from day one:
+        # 0012 exists because int4 overflowed on cache_read_tokens in production.
+        # CREATE TABLE only -- it takes no lock on existing tables, so unlike the
+        # PK-rewriting migrations the proxy does not need to be stopped for it.
+        "0014_usage_bucket",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS usage_bucket (
+                hour_utc                 TEXT    NOT NULL,
+                proxy_key                TEXT    NOT NULL DEFAULT '',
+                group_name               TEXT,
+                credential_id            TEXT    NOT NULL,
+                provider                 TEXT    NOT NULL,
+                model                    TEXT    NOT NULL,
+                via_openai_compat        INTEGER NOT NULL DEFAULT 0,
+                request_kind             TEXT    NOT NULL DEFAULT 'unknown',
+                input_tokens             BIGINT  NOT NULL DEFAULT 0,
+                output_tokens            BIGINT  NOT NULL DEFAULT 0,
+                cache_read_tokens        BIGINT  NOT NULL DEFAULT 0,
+                cache_creation_tokens    BIGINT  NOT NULL DEFAULT 0,
+                cache_creation_5m_tokens BIGINT  NOT NULL DEFAULT 0,
+                cache_creation_1h_tokens BIGINT  NOT NULL DEFAULT 0,
+                web_search_requests      BIGINT  NOT NULL DEFAULT 0,
+                requests                 BIGINT  NOT NULL DEFAULT 0,
+                PRIMARY KEY (hour_utc, proxy_key, credential_id, provider, model,
+                             via_openai_compat, request_kind)
+            )
+            """,
+        ),
+    ),
 )
 
 

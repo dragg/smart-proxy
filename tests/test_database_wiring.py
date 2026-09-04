@@ -36,3 +36,57 @@ class DatabaseWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MigrationBootGuardTests(unittest.IsolatedAsyncioTestCase):
+    """Serving on an unmigrated Postgres schema fails every flush, silently.
+
+    Migrations run only from `smart-proxy db migrate`, and connecting checks
+    nothing, so "restart now, migrate later" used to start a proxy that looked
+    healthy while writing nothing.
+    """
+
+    async def test_guard_is_a_noop_on_sqlite(self) -> None:
+        from smart_proxy.anthropic_proxy import _require_migrations_applied
+
+        class _Sqlite:
+            _backend = "sqlite"
+
+        # Must not raise, and must not touch any migration API.
+        await _require_migrations_applied(_Sqlite())
+
+    async def test_guard_names_the_pending_migrations(self) -> None:
+        from smart_proxy.anthropic_proxy import _require_migrations_applied
+        from smart_proxy.db_migrations import POSTGRES_MIGRATIONS
+
+        all_names = {name for name, _ in POSTGRES_MIGRATIONS}
+        latest = POSTGRES_MIGRATIONS[-1][0]
+
+        class _Postgres:
+            _backend = "postgres"
+
+            async def ensure_migration_table(self):
+                return None
+
+            async def get_applied_migrations(self):
+                return all_names - {latest}
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await _require_migrations_applied(_Postgres())
+        self.assertIn(latest, str(ctx.exception))
+        self.assertIn("smart-proxy db migrate", str(ctx.exception))
+
+    async def test_guard_passes_when_everything_is_applied(self) -> None:
+        from smart_proxy.anthropic_proxy import _require_migrations_applied
+        from smart_proxy.db_migrations import POSTGRES_MIGRATIONS
+
+        class _Postgres:
+            _backend = "postgres"
+
+            async def ensure_migration_table(self):
+                return None
+
+            async def get_applied_migrations(self):
+                return {name for name, _ in POSTGRES_MIGRATIONS}
+
+        await _require_migrations_applied(_Postgres())

@@ -106,11 +106,83 @@ class DatabaseSnapshotRoundTripTests(unittest.TestCase):
                         ]
                     )
 
+                    await source.upsert_usage_bucket_batch(
+                        [
+                            (
+                                "2026-04-04T07",
+                                "sp-roundtrip",
+                                "group-a",
+                                "cred-1",
+                                "openai",
+                                "gpt-5.4",
+                                1,  # via_openai_compat
+                                "main",
+                                10, 20, 1, 2, 3, 4, 5, 6,
+                            )
+                        ]
+                    )
+
                     snapshot = await source.export_snapshot()
                     await target.replace_snapshot(snapshot)
                     roundtrip = await target.export_snapshot()
 
                     self.assertEqual(roundtrip, snapshot)
+                    self.assertTrue(snapshot["usage_bucket"], "table must be exported")
+                finally:
+                    await source.close()
+                    await target.close()
+
+        asyncio.run(run())
+
+    def test_usage_daily_snapshot_keeps_via_openai_compat(self) -> None:
+        """`via_openai_compat` is a PK member and must survive a restore.
+
+        It was missing from `SNAPSHOT_TABLE_SPECS`, so export dropped it and
+        restore wrote the column default 0: a compat row came back as native
+        traffic, and a native+compat pair for one (date, key, cred, provider,
+        model) collided on the primary key instead of restoring. The
+        all-tables round-trip test cannot see this -- it compares an export to
+        an export, and both sides are equally wrong -- so this one reads the
+        restored column back out of the target.
+        """
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                source = Database(str(Path(td) / "source.db"))
+                target = Database(str(Path(td) / "target.db"))
+                await source.connect()
+                await target.connect()
+                try:
+                    await source.add_proxy_key("sp-compat", "compat")
+                    # A native and a compat row that differ ONLY in the flag.
+                    await source.upsert_usage_batch(
+                        [
+                            (
+                                "2026-04-04", "sp-compat", "group-a", "cred-1",
+                                "openai", "gpt-5.4", 0,
+                                10, 20, 0, 0, 0, 0, 0, 1,
+                            ),
+                            (
+                                "2026-04-04", "sp-compat", "group-a", "cred-1",
+                                "openai", "gpt-5.4", 1,
+                                30, 40, 0, 0, 0, 0, 0, 1,
+                            ),
+                        ]
+                    )
+
+                    # Must not raise a duplicate-key error.
+                    await target.replace_snapshot(await source.export_snapshot())
+
+                    cur = await target.db.execute(
+                        "SELECT via_openai_compat, input_tokens FROM usage_daily"
+                        " ORDER BY via_openai_compat"
+                    )
+                    rows = [dict(r) for r in await cur.fetchall()]
+                    self.assertEqual(
+                        [(r["via_openai_compat"], r["input_tokens"]) for r in rows],
+                        [(0, 10), (1, 30)],
+                        "the compat flag must survive the round trip",
+                    )
                 finally:
                     await source.close()
                     await target.close()
@@ -204,6 +276,16 @@ class DatabaseSnapshotRoundTripTests(unittest.TestCase):
                         ]
                     )
 
+                    await target.upsert_usage_bucket_batch(
+                        [
+                            (
+                                "2026-01-01T00", "sp-stale", None, "cred-stale",
+                                "openai", "gpt-old", 0, "main",
+                                1, 1, 0, 0, 0, 0, 0, 1,
+                            )
+                        ]
+                    )
+
                     # Must not raise (duplicate-key on the shared-PK row) and
                     # must fully replace the target's prior contents.
                     await target.replace_snapshot(snapshot)
@@ -211,6 +293,7 @@ class DatabaseSnapshotRoundTripTests(unittest.TestCase):
                     restored = await target.export_snapshot()
                     self.assertEqual(restored["usage_kind_daily"], snapshot["usage_kind_daily"])
                     self.assertEqual(restored["usage_session"], snapshot["usage_session"])
+                    self.assertEqual(restored["usage_bucket"], snapshot["usage_bucket"])
                 finally:
                     await source.close()
                     await target.close()

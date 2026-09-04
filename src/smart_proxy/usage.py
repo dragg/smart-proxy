@@ -583,8 +583,26 @@ def extract_usage_from_sse(provider: str, buf: bytes) -> UsageResult | None:
 
 # Buffer key: (date, proxy_key, group_name, credential_id, provider, model, via_openai_compat)
 _BufKey = tuple[str, str, str, str, str, str, int]
+# Bucket key: the daily key with the hour label in place of the date, plus
+# request_kind -- so usage_daily and usage_kind_daily are both projections.
+_BucketKey = tuple[str, str, str, str, str, str, int, str]
 
 _TAIL_BUF_MAX = 8192
+
+
+class UsageFlushError(Exception):
+    """One or more usage tables failed to flush; every table was still attempted.
+
+    ``failures`` maps table name -> exception. ``rows`` holds the usage_daily
+    rows that DID land (empty when the usage_daily+usage_bucket pair failed),
+    so the caller can still attribute committed usage to OAuth windows.
+    """
+
+    def __init__(self, failures: dict[str, Exception], rows: list[tuple]) -> None:
+        self.failures = failures
+        self.rows = rows
+        detail = "; ".join(f"{name}: {exc!r}" for name, exc in failures.items())
+        super().__init__(f"usage flush failed for {', '.join(failures)} -- {detail}")
 
 
 class UsageTracker:
@@ -600,6 +618,9 @@ class UsageTracker:
         self._session_buf: dict[tuple, list] = {}
         # hour key: (hour_utc, proxy_key, model) -> 8 counters
         self._hour_buf: dict[tuple, list[int]] = {}
+        # bucket key: (hour_utc, proxy_key, group, credential_id, provider,
+        #   model, via_openai_compat, request_kind) -> 8 counters
+        self._bucket_buf: dict[_BucketKey, list[int]] = {}
         self._lock = asyncio.Lock()
 
     def _accumulate(self, buf: dict, key: tuple, counters: tuple) -> None:
@@ -655,6 +676,12 @@ class UsageTracker:
         self._accumulate(self._kind_buf, kkey, counters)
         hkey = (hour, proxy_key, model)
         self._accumulate(self._hour_buf, hkey, counters)
+        # `hour` and `date` come from the one `now` above, so hour[:10] == date
+        # holds for every record -- that is what makes usage_daily a projection
+        # of usage_bucket rather than a second, drifting count.
+        bkey = (hour, proxy_key, group, credential_id, provider, model,
+                int(via_openai_compat), request_kind or "unknown")
+        self._accumulate(self._bucket_buf, bkey, counters)
         if session_id:
             skey = (session_id, proxy_key, request_kind or "unknown", provider, model)
             sacc = self._session_buf.get(skey)
@@ -673,7 +700,20 @@ class UsageTracker:
     async def flush(self, db: object) -> list[tuple]:
         """Move buffered data to the database.
 
-        Returns the flushed row tuples in ``usage_daily`` upsert order:
+        ``usage_daily`` and ``usage_bucket`` are written in ONE transaction --
+        the former is a projection of the latter, so they must never disagree.
+        ``usage_key_hourly``, ``usage_kind_daily`` and ``usage_session`` are
+        each written independently, so one table's failure no longer discards
+        the others' already-swapped-out buffers. That was the 2026-08-21
+        failure: a single broken write starved the spend limiter's re-seed
+        source for hours while serving looked healthy.
+
+        A failed table's buffer is still lost. Re-merging it was considered and
+        rejected on 2026-08-21 (degraded-mode spec, section 3): during a long
+        outage the buffer grows without bound.
+
+        Raises :class:`UsageFlushError` *after* attempting every write if any
+        of them failed. Returns the flushed ``usage_daily`` row tuples:
         (date, proxy_key, group_name, credential_id, provider, model,
         via_openai_compat, input, output, cache_read, cache_creation,
         cache_creation_5m, cache_creation_1h, web_search_requests, requests).
@@ -684,14 +724,11 @@ class UsageTracker:
         async with self._lock:
             if not self._buf:
                 return []
-            snapshot = self._buf
-            self._buf = {}
-            kind_snapshot = self._kind_buf
-            self._kind_buf = {}
-            session_snapshot = self._session_buf
-            self._session_buf = {}
-            hour_snapshot = self._hour_buf
-            self._hour_buf = {}
+            snapshot, self._buf = self._buf, {}
+            kind_snapshot, self._kind_buf = self._kind_buf, {}
+            session_snapshot, self._session_buf = self._session_buf, {}
+            hour_snapshot, self._hour_buf = self._hour_buf, {}
+            bucket_snapshot, self._bucket_buf = self._bucket_buf, {}
 
         rows = [
             (
@@ -700,9 +737,10 @@ class UsageTracker:
             )
             for k, v in snapshot.items()
         ]
-        await db.upsert_usage_batch(rows)
-        logger.debug("Flushed %d usage rows to DB", len(rows))
-
+        bucket_rows = [
+            (k[0], k[1], (k[2] or None), k[3], k[4], k[5], k[6], k[7], *v)
+            for k, v in bucket_snapshot.items()
+        ]
         kind_rows = [(k[0], k[1], k[2], k[3], k[4], *v) for k, v in kind_snapshot.items()]
         session_rows = [
             (k[0], k[1], k[2], k[3], k[4],   # session_id, proxy_key, request_kind, provider, model
@@ -710,8 +748,28 @@ class UsageTracker:
              *v[4:])                          # 8 counters
             for k, v in session_snapshot.items()
         ]
-        await db.upsert_usage_kind_batch(kind_rows)
-        await db.upsert_usage_session_batch(session_rows)
         hour_rows = [(k[0], k[1], k[2], *v) for k, v in hour_snapshot.items()]
-        await db.upsert_usage_hourly_batch(hour_rows)
+
+        failures: dict[str, Exception] = {}
+        landed: list[tuple] = []
+        try:
+            await db.upsert_usage_daily_and_bucket_batch(rows, bucket_rows)
+            landed = rows
+        except Exception as exc:
+            failures["usage_daily+usage_bucket"] = exc
+
+        # The spend limiter's re-seed source goes first among the independents.
+        for name, write, batch in (
+            ("usage_key_hourly", db.upsert_usage_hourly_batch, hour_rows),
+            ("usage_kind_daily", db.upsert_usage_kind_batch, kind_rows),
+            ("usage_session", db.upsert_usage_session_batch, session_rows),
+        ):
+            try:
+                await write(batch)
+            except Exception as exc:
+                failures[name] = exc
+
+        if failures:
+            raise UsageFlushError(failures, landed)
+        logger.debug("Flushed %d usage rows to DB", len(rows))
         return rows

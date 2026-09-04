@@ -348,6 +348,35 @@ CREATE TABLE IF NOT EXISTS usage_key_hourly (
     PRIMARY KEY (hour_utc, proxy_key, model)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_key_hourly_hour ON usage_key_hourly(hour_utc);
+
+-- Full usage_daily dimension set (+ request_kind) at hour grain, for the
+-- dashboard's arbitrary-window view. usage_daily and usage_kind_daily are
+-- projections of this table (GROUP BY substr(hour_utc, 1, 10)); the writer
+-- keeps them in step by writing usage_daily and usage_bucket in ONE
+-- transaction. Deliberately separate from usage_key_hourly, which feeds the
+-- spend limiter and is pruned -- this table is never pruned (2026-09-04).
+-- No secondary index: hour_utc is the PK's leading column, so the PK's own
+-- index already serves every range scan and MIN() here.
+CREATE TABLE IF NOT EXISTS usage_bucket (
+    hour_utc                 TEXT    NOT NULL,
+    proxy_key                TEXT    NOT NULL DEFAULT '',
+    group_name               TEXT,
+    credential_id            TEXT    NOT NULL,
+    provider                 TEXT    NOT NULL,
+    model                    TEXT    NOT NULL,
+    via_openai_compat        INTEGER NOT NULL DEFAULT 0,
+    request_kind             TEXT    NOT NULL DEFAULT 'unknown',
+    input_tokens             INTEGER NOT NULL DEFAULT 0,
+    output_tokens            INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens        INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens    INTEGER NOT NULL DEFAULT 0,
+    cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
+    web_search_requests      INTEGER NOT NULL DEFAULT 0,
+    requests                 INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_utc, proxy_key, credential_id, provider, model,
+                 via_openai_compat, request_kind)
+);
 """
 
 MIGRATIONS = [
@@ -617,6 +646,10 @@ SNAPSHOT_TABLE_SPECS: tuple[tuple[str, tuple[str, ...], str], ...] = (
             "credential_id",
             "provider",
             "model",
+            # PK member: omitting it made export drop the flag and restore
+            # write DEFAULT 0, turning a compat row native and colliding with
+            # its native twin for the same (date, key, cred, provider, model).
+            "via_openai_compat",
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
@@ -626,7 +659,7 @@ SNAPSHOT_TABLE_SPECS: tuple[tuple[str, tuple[str, ...], str], ...] = (
             "web_search_requests",
             "requests",
         ),
-        "date, proxy_key, credential_id, provider, model",
+        "date, proxy_key, credential_id, provider, model, via_openai_compat",
     ),
     (
         "usage_kind_daily",
@@ -849,6 +882,17 @@ SNAPSHOT_TABLE_SPECS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ),
         "hour_utc, proxy_key, model",
     ),
+    (
+        "usage_bucket",
+        (
+            "hour_utc", "proxy_key", "group_name", "credential_id", "provider", "model",
+            "via_openai_compat", "request_kind",
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_creation_tokens", "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens", "web_search_requests", "requests",
+        ),
+        "hour_utc, proxy_key, credential_id, provider, model, via_openai_compat, request_kind",
+    ),
 )
 
 # Import-time defaults for columns absent from older snapshots (their NOT NULL
@@ -858,6 +902,9 @@ _SNAPSHOT_COLUMN_DEFAULTS: dict[tuple[str, str], object] = {
     ("usage_session", "project"): "",
     ("usage_session", "title"): "",
     # Snapshots taken before these columns existed carry no value for them.
+    ("usage_daily", "via_openai_compat"): 0,
+    ("usage_bucket", "via_openai_compat"): 0,
+    ("usage_bucket", "request_kind"): "unknown",
     ("anthropic_keys", "role"): "primary",
     ("anthropic_keys", "allowed_proxy_keys"): "[]",
 }
@@ -877,6 +924,7 @@ SNAPSHOT_DELETE_ORDER: tuple[str, ...] = (
     "usage_kind_daily",
     "usage_session",
     "usage_key_hourly",
+    "usage_bucket",
     "proxy_key_limits",
     "proxy_api_keys",
     "anthropic_keys",
@@ -1011,6 +1059,24 @@ def build_usage_hourly_upsert_sql(backend: str) -> str:
         "     cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests, requests)\n"
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n"
         "ON CONFLICT(hour_utc, proxy_key, model) DO UPDATE SET\n"
+        f"                   {sets}"
+    )
+
+
+def build_usage_bucket_upsert_sql(backend: str) -> str:
+    q = "usage_bucket." if backend == "postgres" else ""
+    sets = ",\n                   ".join(
+        f"{c} = {q}{c} + excluded.{c}" for c in _KIND_COUNTERS)
+    return (
+        "INSERT INTO usage_bucket\n"
+        "    (hour_utc, proxy_key, group_name, credential_id, provider, model,\n"
+        "     via_openai_compat, request_kind,\n"
+        "     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,\n"
+        "     cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests, requests)\n"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n"
+        "ON CONFLICT(hour_utc, proxy_key, credential_id, provider, model,\n"
+        "            via_openai_compat, request_kind) DO UPDATE SET\n"
+        f"                   group_name = COALESCE(excluded.group_name, {q}group_name),\n"
         f"                   {sets}"
     )
 
@@ -1201,12 +1267,19 @@ class Database:
     async def transaction(self):
         """Group statements so they commit or roll back together.
 
-        On sqlite this is today's behaviour made explicit: statements, then one
-        commit. The Postgres backend overrides it with a real transaction on the
-        shared connection, serialised so concurrent tasks cannot join each
+        sqlite opens an implicit transaction on the first DML. Without the
+        explicit rollback below, an exception inside the block would leave that
+        transaction open and the *next* unrelated commit() would commit the
+        half-written work -- so a failed pair write could land one of its two
+        tables. The Postgres backend overrides this with a real transaction on
+        the shared connection, serialised so concurrent tasks cannot join each
         other's.
         """
-        yield self
+        try:
+            yield self
+        except BaseException:
+            await self.db.rollback()
+            raise
         await self.db.commit()
 
     def is_available(self) -> bool:
@@ -1476,6 +1549,56 @@ class Database:
             await self.db.executemany(build_usage_hourly_upsert_sql(self._backend), rows)
             await self.db.commit()
 
+    async def upsert_usage_bucket_batch(self, rows: list[tuple]) -> None:
+        """Batch-upsert hour-grain usage rows (16-column canonical order).
+
+        Each tuple: (hour_utc, proxy_key, group_name, credential_id, provider,
+                      model, via_openai_compat, request_kind,
+                      input_tokens, output_tokens, cache_read_tokens,
+                      cache_creation_tokens, cache_creation_5m_tokens,
+                      cache_creation_1h_tokens, web_search_requests, requests)
+
+        Standalone entry point for tests and tooling; the tracker writes this
+        table together with usage_daily via the atomic pair below.
+        """
+        async with self.transaction():
+            if not rows:
+                return
+            await self.db.executemany(build_usage_bucket_upsert_sql(self._backend), rows)
+            await self.db.commit()
+
+    async def upsert_usage_daily_and_bucket_batch(
+        self, daily_rows: list[tuple], bucket_rows: list[tuple]
+    ) -> None:
+        """Write usage_daily and usage_bucket in ONE transaction.
+
+        usage_daily is a projection of usage_bucket, so the two must agree:
+        they land together or not at all. One commit, after both executemany
+        calls -- a commit between them would break atomicity on sqlite.
+        """
+        async with self.transaction():
+            if daily_rows:
+                await self.db.executemany(
+                    build_usage_upsert_sql(self._backend), daily_rows
+                )
+            if bucket_rows:
+                await self.db.executemany(
+                    build_usage_bucket_upsert_sql(self._backend), bucket_rows
+                )
+            if daily_rows or bucket_rows:
+                await self.db.commit()
+
+    async def min_usage_bucket_hour(self) -> str | None:
+        """Earliest hour with a bucket row, or None when the table is empty.
+
+        Reports when hour-grain writing began. It is a lower bound, not a
+        promise that coverage since then is gap-free -- a database outage
+        leaves the same hole in every usage table.
+        """
+        cur = await self.db.execute("SELECT MIN(hour_utc) AS h FROM usage_bucket")
+        row = await cur.fetchone()
+        return (row["h"] if row else None) or None
+
     async def query_usage_key_hourly(
         self, start_hour: str, end_hour: str
     ) -> list[dict]:
@@ -1497,6 +1620,89 @@ class Database:
                FROM usage_key_hourly
                WHERE hour_utc >= ? AND hour_utc < ?
                GROUP BY proxy_key, model""",
+            (start_hour, end_hour),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+    async def query_usage_bucket_by_key_model(
+        self, start_hour: str, end_hour: str
+    ) -> list[dict]:
+        """Same row shape as :meth:`query_usage_by_key_model`, over ``hour_utc``
+        in ``[start_hour, end_hour]`` -- both bounds inclusive, ``'%Y-%m-%dT%H'``.
+
+        ``request_kind`` is summed away on purpose: ``_build_usage_cost_groups``
+        appends one ``models[]`` entry per input row, so rows split by kind
+        would list every model two to four times under each key. The per-kind
+        view is :meth:`query_usage_bucket_by_kind`.
+        """
+        cur = await self.db.execute(
+            """SELECT u.proxy_key, u.group_name,
+                      COALESCE(pk.name, '') AS key_name,
+                      u.provider, u.model, u.via_openai_compat,
+                      SUM(u.input_tokens)  AS input_tokens,
+                      SUM(u.output_tokens) AS output_tokens,
+                      SUM(u.cache_read_tokens) AS cache_read_tokens,
+                      SUM(u.cache_creation_tokens) AS cache_creation_tokens,
+                      SUM(u.cache_creation_5m_tokens) AS cache_creation_5m_tokens,
+                      SUM(u.cache_creation_1h_tokens) AS cache_creation_1h_tokens,
+                      SUM(u.web_search_requests) AS web_search_requests,
+                      SUM(u.requests)      AS requests
+               FROM usage_bucket u
+               LEFT JOIN proxy_api_keys pk ON pk.key = u.proxy_key
+               WHERE u.hour_utc >= ? AND u.hour_utc <= ?
+               GROUP BY u.proxy_key, u.group_name, pk.name, u.provider, u.model,
+                        u.via_openai_compat
+               ORDER BY COALESCE(NULLIF(pk.name, ''), NULLIF(u.group_name, ''), u.proxy_key),
+                        u.provider, u.model""",
+            (start_hour, end_hour),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+    async def query_usage_bucket_series(
+        self, start_hour: str, end_hour: str
+    ) -> list[dict]:
+        """Per-(hour_utc, provider, model) sums over the inclusive range.
+
+        Kept per model so each row can be priced before the hours are summed.
+        Hours with no traffic are absent; the dashboard zero-fills them.
+        """
+        cur = await self.db.execute(
+            """SELECT hour_utc, provider, model,
+                      SUM(input_tokens)  AS input_tokens,
+                      SUM(output_tokens) AS output_tokens,
+                      SUM(cache_read_tokens) AS cache_read_tokens,
+                      SUM(cache_creation_tokens) AS cache_creation_tokens,
+                      SUM(cache_creation_5m_tokens) AS cache_creation_5m_tokens,
+                      SUM(cache_creation_1h_tokens) AS cache_creation_1h_tokens,
+                      SUM(web_search_requests) AS web_search_requests,
+                      SUM(requests)      AS requests
+               FROM usage_bucket
+               WHERE hour_utc >= ? AND hour_utc <= ?
+               GROUP BY hour_utc, provider, model
+               ORDER BY hour_utc, provider, model""",
+            (start_hour, end_hour),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+    async def query_usage_bucket_by_kind(
+        self, start_hour: str, end_hour: str
+    ) -> list[dict]:
+        """Same row shape as :meth:`query_usage_by_kind`, over the inclusive hour range."""
+        cur = await self.db.execute(
+            """SELECT u.proxy_key, COALESCE(pk.name, '') AS key_name, u.request_kind,
+                      u.provider, u.model,
+                      SUM(u.input_tokens) AS input_tokens,
+                      SUM(u.output_tokens) AS output_tokens,
+                      SUM(u.cache_read_tokens) AS cache_read_tokens,
+                      SUM(u.cache_creation_tokens) AS cache_creation_tokens,
+                      SUM(u.cache_creation_5m_tokens) AS cache_creation_5m_tokens,
+                      SUM(u.cache_creation_1h_tokens) AS cache_creation_1h_tokens,
+                      SUM(u.web_search_requests) AS web_search_requests,
+                      SUM(u.requests) AS requests
+               FROM usage_bucket u
+               LEFT JOIN proxy_api_keys pk ON pk.key = u.proxy_key
+               WHERE u.hour_utc >= ? AND u.hour_utc <= ?
+               GROUP BY u.proxy_key, pk.name, u.request_kind, u.provider, u.model""",
             (start_hour, end_hour),
         )
         return [dict(row) for row in await cur.fetchall()]

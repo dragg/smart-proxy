@@ -11,6 +11,7 @@ duplicating the rendering logic.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 
@@ -48,6 +49,96 @@ def _usage_date_range(request: web.Request) -> tuple[str, str] | web.Response:
         )
 
     return start.isoformat(), end.isoformat()
+
+
+HOUR_FMT = "%Y-%m-%dT%H"
+# The series is zero-filled per hour, so an uncapped span would return one
+# point per hour since the table began. 92 days is 2208 buckets.
+_MAX_HOUR_SPAN = timedelta(days=92)
+_HOUR_DEFAULT_SPAN = timedelta(hours=23)   # 24 inclusive buckets
+
+
+@dataclass(frozen=True)
+class UsageRange:
+    """A resolved dashboard range. Both bounds are inclusive, UTC, canonical."""
+
+    granularity: str   # "day" | "hour"
+    start: str
+    end: str
+
+
+def _hour_range(request: web.Request) -> tuple[str, str] | web.Response:
+    """Resolve the ``YYYY-MM-DDTHH`` grammar.
+
+    Comparisons stay on naive datetimes: ``strptime`` yields naive values, and
+    mixing them with an aware "now" raises TypeError.
+    """
+    bad_grammar = web.Response(
+        status=400,
+        text="start and end must both use YYYY-MM-DD or both use YYYY-MM-DDTHH (UTC)",
+        content_type="text/plain",
+    )
+    start_raw = (request.query.get("start") or "").strip()
+    end_raw = (request.query.get("end") or "").strip()
+
+    now_hour = datetime.now(timezone.utc).replace(
+        tzinfo=None, minute=0, second=0, microsecond=0
+    )
+    try:
+        end = datetime.strptime(end_raw, HOUR_FMT) if end_raw else now_hour
+        start = (
+            datetime.strptime(start_raw, HOUR_FMT)
+            if start_raw
+            else end - _HOUR_DEFAULT_SPAN
+        )
+    except ValueError:
+        return bad_grammar
+
+    if start > end:
+        return web.Response(
+            status=400,
+            text="start must be before or equal to end",
+            content_type="text/plain",
+        )
+    if end - start >= _MAX_HOUR_SPAN:
+        return web.Response(
+            status=400,
+            text="hour ranges are limited to 92 days; use YYYY-MM-DD for longer spans",
+            content_type="text/plain",
+        )
+    # Re-serialise: strptime accepts a single-digit hour ("T9"), and the string
+    # range 'hour_utc >= ...T9' would then be wrong on both backends.
+    return start.strftime(HOUR_FMT), end.strftime(HOUR_FMT)
+
+
+def _usage_range(request: web.Request) -> UsageRange | web.Response:
+    """Pick the grammar from the parameters alone, never from what the data covers.
+
+    Coverage-based selection would make the same query change source as the
+    table fills up, and would let /api/usage disagree with /_usage for a date
+    both can serve.
+    """
+    raw = f"{request.query.get('start') or ''}{request.query.get('end') or ''}"
+    if "T" not in raw:
+        day = _usage_date_range(request)
+        if isinstance(day, web.Response):
+            return day
+        return UsageRange("day", day[0], day[1])
+    hour = _hour_range(request)
+    if isinstance(hour, web.Response):
+        return hour
+    return UsageRange("hour", hour[0], hour[1])
+
+
+def _iter_hours(start_hour: str, end_hour: str) -> list[str]:
+    """Every canonical hour label from start to end, both inclusive."""
+    cur = datetime.strptime(start_hour, HOUR_FMT)
+    end = datetime.strptime(end_hour, HOUR_FMT)
+    out: list[str] = []
+    while cur <= end:
+        out.append(cur.strftime(HOUR_FMT))
+        cur += timedelta(hours=1)
+    return out
 
 
 def _int_usage(row: dict, key: str) -> int:
@@ -190,13 +281,68 @@ def _build_usage_cost_groups(rows: list[dict], prices: dict) -> list[dict]:
     return sorted(groups.values(), key=lambda item: item["label"].lower())
 
 
+def build_usage_bucket_series(
+    rows: list[dict], prices: dict, start_hour: str, end_hour: str
+) -> list[dict]:
+    """One entry per hour in the inclusive range, zero-filled where idle.
+
+    ``rows`` are per (hour, provider, model) so each model is priced with its
+    own rate before the hour is summed.
+    """
+    buckets: dict[str, dict] = {
+        hour: {
+            "hour": hour,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "web_search_requests": 0,
+            "cost": 0.0,
+            "partial": False,
+            "unknown": False,
+        }
+        for hour in _iter_hours(start_hour, end_hour)
+    }
+
+    for row in rows:
+        bucket = buckets.get(str(row.get("hour_utc") or ""))
+        if bucket is None:
+            continue
+        cost, _base_cost, _cache_cost = _row_cost_split(row, prices)
+        bucket["requests"] += _int_usage(row, "requests")
+        bucket["input_tokens"] += _int_usage(row, "input_tokens")
+        bucket["output_tokens"] += _int_usage(row, "output_tokens")
+        bucket["cache_read_tokens"] += _int_usage(row, "cache_read_tokens")
+        bucket["cache_creation_tokens"] += _int_usage(row, "cache_creation_tokens")
+        bucket["web_search_requests"] += _int_usage(row, "web_search_requests")
+        bucket["partial"] = bucket["partial"] or cost.partial
+        bucket["unknown"] = bucket["unknown"] or cost.unknown_pricing
+        if cost.total_cost is not None:
+            bucket["cost"] += cost.total_cost
+
+    return [buckets[hour] for hour in _iter_hours(start_hour, end_hour)]
+
+
 def build_usage_cost_json(
-    start: str, end: str, rows: list[dict], prices: dict
+    start: str,
+    end: str,
+    rows: list[dict],
+    prices: dict,
+    *,
+    granularity: str = "day",
+    covered_from: str | None = None,
+    series: list[dict] | None = None,
 ) -> dict:
-    """JSON-serializable version of the usage dashboard data (for /api/usage)."""
+    """JSON-serializable version of the usage dashboard data (for /api/usage).
+
+    ``covered_from`` and ``series`` are emitted only for the hour grammar, so
+    the day response stays exactly what it is today plus ``granularity``.
+    """
     groups = _build_usage_cost_groups(rows, prices)
     total_known = sum(float(g["known_cost"]) for g in groups)
-    return {
+    payload = {
+        "granularity": granularity,
         "start": start,
         "end": end,
         "total_known_cost": round(total_known, 2),
@@ -204,6 +350,10 @@ def build_usage_cost_json(
         "unknown": any(bool(g["unknown"]) for g in groups),
         "groups": groups,
     }
+    if granularity == "hour":
+        payload["covered_from"] = covered_from
+        payload["series"] = series or []
+    return payload
 
 
 def build_usage_kind_json(rows: list[dict], prices: dict) -> list[dict]:

@@ -61,6 +61,7 @@ _COUNTER_TABLES = (
     "usage_kind_daily",
     "usage_session",
     "usage_key_hourly",
+    "usage_bucket",
 )
 
 

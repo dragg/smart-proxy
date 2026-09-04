@@ -168,6 +168,87 @@ class ApiUsageKeysTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["groups"], [])
         self.assertEqual(payload["start"], "2026-04-01")
 
+    async def test_usage_day_grammar_keeps_the_old_db_calls(self) -> None:
+        """The day path must not grow a call: this db is a bare MagicMock, so
+        any unstubbed `await db.x()` raises TypeError rather than returning."""
+        db = MagicMock()
+        db.query_usage_by_key_model = AsyncMock(return_value=[])
+        db.get_all_model_prices = AsyncMock(return_value=[])
+        req = make_mocked_request(
+            "GET", "/api/usage?start=2026-04-01&end=2026-04-02",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN, "db": db},
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_usage(req)
+        import json
+        payload = json.loads(resp.body)
+        self.assertEqual(payload["granularity"], "day")
+        self.assertNotIn("series", payload)
+        db.query_usage_by_key_model.assert_awaited_once_with("2026-04-01", "2026-04-02")
+
+    async def test_usage_hour_grammar_uses_the_bucket_queries(self) -> None:
+        db = MagicMock()
+        db.query_usage_bucket_by_key_model = AsyncMock(return_value=[])
+        db.query_usage_bucket_series = AsyncMock(return_value=[])
+        db.min_usage_bucket_hour = AsyncMock(return_value="2026-09-04T18")
+        db.query_usage_by_key_model = AsyncMock(return_value=[])
+        db.get_all_model_prices = AsyncMock(return_value=[])
+        req = make_mocked_request(
+            "GET", "/api/usage?start=2026-09-05T10&end=2026-09-05T14",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN, "db": db},
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_usage(req)
+        self.assertEqual(resp.status, 200)
+        import json
+        payload = json.loads(resp.body)
+
+        db.query_usage_bucket_by_key_model.assert_awaited_once_with(
+            "2026-09-05T10", "2026-09-05T14")
+        db.query_usage_bucket_series.assert_awaited_once_with(
+            "2026-09-05T10", "2026-09-05T14")
+        db.min_usage_bucket_hour.assert_awaited_once()
+        db.query_usage_by_key_model.assert_not_awaited()
+
+        self.assertEqual(payload["granularity"], "hour")
+        self.assertEqual(payload["covered_from"], "2026-09-04T18")
+        self.assertEqual(len(payload["series"]), 5, "T10..T14 inclusive")
+
+    async def test_usage_mixed_grammar_is_a_400(self) -> None:
+        req = make_mocked_request(
+            "GET", "/api/usage?start=2026-09-05&end=2026-09-05T14",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN, "db": MagicMock()},
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_usage(req)
+        self.assertEqual(resp.status, 400)
+
+    async def test_kinds_hour_grammar_uses_the_bucket_query(self) -> None:
+        db = MagicMock()
+        db.query_usage_bucket_by_kind = AsyncMock(return_value=[])
+        db.query_usage_by_kind = AsyncMock(return_value=[])
+        db.get_all_model_prices = AsyncMock(return_value=[])
+        req = make_mocked_request(
+            "GET", "/api/usage/kinds?start=2026-09-05T10&end=2026-09-05T14",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN, "db": db},
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_usage_kinds(req)
+        self.assertEqual(resp.status, 200)
+        db.query_usage_bucket_by_kind.assert_awaited_once_with(
+            "2026-09-05T10", "2026-09-05T14")
+        db.query_usage_by_kind.assert_not_awaited()
+
+    async def test_kinds_garbage_range_is_a_400(self) -> None:
+        """It used to reach SQL as a bind parameter and quietly match nothing."""
+        req = make_mocked_request(
+            "GET", "/api/usage/kinds?start=nonsense&end=also-nonsense",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN, "db": MagicMock()},
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_usage_kinds(req)
+        self.assertEqual(resp.status, 400)
+
     async def test_keys_redacts_to_prefix(self) -> None:
         db = MagicMock()
         db.list_proxy_keys = AsyncMock(return_value=[

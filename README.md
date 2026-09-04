@@ -160,8 +160,11 @@ keys yet refuses everyone rather than opening up — so mint the first one with
 
 **Accounting** is written per request: tokens and cost land in `usage_daily`
 and `usage_key_hourly`, request kind in `usage_kind_daily`, and Claude Code
-sessions in `usage_session`. `GET /_oauth_usage` reports each upstream
-account's remaining quota as Anthropic itself sees it.
+sessions in `usage_session`. `usage_bucket` carries the same dimensions as
+`usage_daily` at hour grain — it is what the dashboard reads for sub-day
+ranges, and unlike `usage_key_hourly` (35-day retention, spend-limiter input)
+it is never pruned. `GET /_oauth_usage` reports each upstream account's
+remaining quota as Anthropic itself sees it.
 
 **Storage** is SQLite by default and PostgreSQL when `DATABASE_URL` is set. If
 the database goes away, the proxy keeps serving from memory and alerts — it
@@ -464,6 +467,21 @@ Request-kind and per-session data land in two additive tables,
 `usage_kind_daily` (daily counters per kind and model) and `usage_session`
 (session-level audit trail). Both are surfaced in the dashboard's **Traffic**
 tab via `/api/usage/kinds` and `/api/sessions` endpoints.
+
+### Time ranges
+
+`/api/usage` and `/api/usage/kinds` take `start` and `end` in one of two
+grammars, and the grammar alone decides which table answers:
+
+| Parameters | Source | Meaning |
+|---|---|---|
+| `start=2026-09-01&end=2026-09-05` | `usage_daily` / `usage_kind_daily` | whole UTC days, both inclusive |
+| `start=2026-09-05T10&end=2026-09-05T14` | `usage_bucket` | whole UTC hours, both inclusive |
+
+Both bounds must use the same grammar; mixing them is a `400`. Hour ranges are
+capped at 92 days. An hour response also carries `series` (one entry per hour,
+zero-filled) and `covered_from` (the earliest hour on record — there is no
+backfill, so hour data starts at the first flush after this feature shipped).
 
 ## Troubleshooting
 

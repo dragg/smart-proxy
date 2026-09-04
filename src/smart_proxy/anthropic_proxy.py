@@ -67,8 +67,8 @@ from smart_proxy.notifier import AlertThrottle, TelegramNotifier
 from smart_proxy.openai_compat import setup_openai_compat
 from smart_proxy.request_classify import _session_id, _system_text, classify_request
 from smart_proxy.usage import (
-    UsageTracker, extract_usage, extract_usage_from_sse, _TAIL_BUF_MAX,
-    build_price_lookup, estimate_cost_with_cache,
+    UsageFlushError, UsageTracker, extract_usage, extract_usage_from_sse,
+    _TAIL_BUF_MAX, build_price_lookup, estimate_cost_with_cache,
 )
 from smart_proxy.usage_dashboard import register_usage_dashboard
 
@@ -4505,19 +4505,37 @@ def _window_usage_deltas(rows: list[tuple]) -> list[dict]:
     ]
 
 
+async def _attribute_flushed_usage(
+    db: Database, rows: list[tuple], app: object | None
+) -> None:
+    deltas = _window_usage_deltas(rows)
+    if not deltas:
+        return
+    try:
+        await db.attribute_oauth_window_usage(deltas)
+    except Exception as exc:
+        logger.exception("OAuth window usage attribution failed")
+        _alert_failure(app, source="usage attribution to the OAuth window", exc=exc)
+
+
 async def _flush_usage(
     tracker: UsageTracker, db: Database, app: object | None = None
 ) -> int:
-    """Flush buffered usage; attribute the deltas to OAuth rate-limit windows."""
-    rows = await tracker.flush(db)
+    """Flush buffered usage; attribute whatever landed to OAuth rate-limit windows.
+
+    A partial flush still raises, so the loop alerts and `_resync_limiter` /
+    `_on_shutdown` behave as before -- but the usage_daily rows that *did*
+    commit are attributed first. They are in the database; without this they
+    would never be counted against any window.
+    """
+    try:
+        rows = await tracker.flush(db)
+    except UsageFlushError as exc:
+        if exc.rows:
+            await _attribute_flushed_usage(db, exc.rows, app)
+        raise
     if rows:
-        deltas = _window_usage_deltas(rows)
-        if deltas:
-            try:
-                await db.attribute_oauth_window_usage(deltas)
-            except Exception as exc:
-                logger.exception("OAuth window usage attribution failed")
-                _alert_failure(app, source="usage attribution to the OAuth window", exc=exc)
+        await _attribute_flushed_usage(db, rows, app)
     return len(rows)
 
 
@@ -4957,12 +4975,38 @@ def _start_background_tasks(app: web.Application) -> None:
             _watch_background_task(app, label, task)
 
 
+async def _require_migrations_applied(db: Database) -> None:
+    """Postgres only: refuse to boot with pending migrations.
+
+    Postgres migrations run only from `smart-proxy db migrate`; connecting
+    checks nothing. Serving on an unmigrated schema means every 60s flush
+    fails -- and a failing flush used to take usage_key_hourly, the spend
+    limiter's re-seed source, down with it. A refused boot is loud and cheap;
+    a silent hole is neither. sqlite applies its schema on connect, so this
+    is a no-op there.
+    """
+    if getattr(db, "_backend", "sqlite") != "postgres":
+        return
+    from smart_proxy.db_migrations import POSTGRES_MIGRATIONS
+
+    await db.ensure_migration_table()
+    applied = await db.get_applied_migrations()
+    pending = [name for name, _statements in POSTGRES_MIGRATIONS if name not in applied]
+    if pending:
+        raise RuntimeError(
+            "pending PostgreSQL migrations: "
+            + ", ".join(pending)
+            + " -- run `smart-proxy db migrate` before starting the proxy"
+        )
+
+
 async def _on_startup(app: web.Application) -> None:
     db = build_database_from_config(
         database_url=app.get("database_url", ""),
         db_path=app["db_path"],
     )
     await db.connect()
+    await _require_migrations_applied(db)
     app["db"] = db
 
     pool = AnthropicKeyPool(db)

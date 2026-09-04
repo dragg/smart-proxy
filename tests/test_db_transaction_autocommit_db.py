@@ -165,5 +165,78 @@ class TransactionIsolationTests(unittest.TestCase):
         asyncio.run(run())
 
 
+class SqliteTransactionRollbackTests(unittest.TestCase):
+    """`transaction()` promises "commit or roll back together" — sqlite must keep it.
+
+    sqlite opens an implicit transaction on the first DML. Without an explicit
+    rollback, an exception inside the block leaves that transaction open, and
+    the *next* unrelated `commit()` commits the half-written work. That breaks
+    the usage_daily/usage_bucket pair, whose whole point is that the two tables
+    cannot disagree.
+    """
+
+    def _sqlite_db(self, td: str):
+        from smart_proxy.db import build_database_from_config
+        return build_database_from_config(
+            database_url="", db_path=str(Path(td) / "t.db")
+        )
+
+    def test_transaction_rolls_back_on_exception(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                db = self._sqlite_db(td)
+                await db.connect()
+                try:
+                    with self.assertRaises(RuntimeError):
+                        async with db.transaction():
+                            await db.db.execute(
+                                "INSERT INTO proxy_api_keys (key, name, active, created_at)"
+                                " VALUES ('sp-rollback', 'x', 1, '2026-09-04')"
+                            )
+                            raise RuntimeError("boom")
+
+                    cur = await db.db.execute(
+                        "SELECT COUNT(*) AS n FROM proxy_api_keys WHERE key = 'sp-rollback'"
+                    )
+                    self.assertEqual((await cur.fetchone())["n"], 0)
+                finally:
+                    await db.close()
+
+        asyncio.run(run())
+
+    def test_rolled_back_work_does_not_leak_into_the_next_commit(self) -> None:
+        """The regression the rollback exists to prevent."""
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                db = self._sqlite_db(td)
+                await db.connect()
+                try:
+                    with self.assertRaises(RuntimeError):
+                        async with db.transaction():
+                            await db.db.execute(
+                                "INSERT INTO proxy_api_keys (key, name, active, created_at)"
+                                " VALUES ('sp-leak', 'x', 1, '2026-09-04')"
+                            )
+                            raise RuntimeError("boom")
+
+                    # An unrelated, successful unit of work.
+                    async with db.transaction():
+                        await db.db.execute(
+                            "INSERT INTO proxy_api_keys (key, name, active, created_at)"
+                            " VALUES ('sp-ok', 'y', 1, '2026-09-04')"
+                        )
+                        await db.db.commit()
+
+                    cur = await db.db.execute(
+                        "SELECT key FROM proxy_api_keys ORDER BY key"
+                    )
+                    keys = [row["key"] for row in await cur.fetchall()]
+                    self.assertEqual(keys, ["sp-ok"])
+                finally:
+                    await db.close()
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()
