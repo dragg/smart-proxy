@@ -23,6 +23,7 @@ def _pool(valid: str = "sp-team"):
     pool = MagicMock()
     pool.check_auth.side_effect = lambda t: t == valid
     pool.is_proxy_key.side_effect = lambda t: t == valid
+    pool.cooldown_snapshot.return_value = []
     return pool
 
 
@@ -615,3 +616,48 @@ class KeyLimitsApiTests(unittest.IsolatedAsyncioTestCase):
         resp = await dashboard_api._api_key_limits(req)
         self.assertEqual(resp.status, 400)
         limiter.set_limit.assert_not_awaited()
+
+
+class CooldownClearTests(unittest.IsolatedAsyncioTestCase):
+    """The dashboard's escape hatch for a rate-limited pool."""
+
+    def _app(self, pool):
+        db = MagicMock()
+        db.list_anthropic_keys = AsyncMock(return_value=[])
+        db.list_proxy_keys = AsyncMock(return_value=[])
+        return {"anthropic_pool": pool, "dashboard_secret": ADMIN, "db": db}
+
+    async def test_key_list_reports_parked_keys(self) -> None:
+        pool = _pool()
+        pool.cooldown_snapshot.return_value = [
+            {"key_id": "key-a", "model": "claude-opus-5", "seconds_left": 2309}
+        ]
+        req = make_mocked_request(
+            "GET", "/api/anthropic/keys", app=self._app(pool),
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        resp = await dashboard_api._api_anthropic_keys(req)
+        self.assertEqual(resp.status, 200)
+        # The button only shows when this is non-empty, so it has to ship here.
+        self.assertEqual(json.loads(resp.body)["cooldowns"][0]["seconds_left"], 2309)
+
+    async def test_clear_requires_admin_not_just_a_proxy_key(self) -> None:
+        pool = _pool()
+        req = make_mocked_request(
+            "POST", "/api/anthropic/cooldowns/clear", app=self._app(pool),
+            headers={"Authorization": "Bearer sp-team"},
+        )
+        self.assertEqual((await dashboard_api._api_anthropic_cooldowns_clear(req)).status, 403)
+        pool.clear_cooldowns.assert_not_called()
+
+    async def test_admin_clears_every_model_at_once(self) -> None:
+        pool = _pool()
+        pool.clear_cooldowns.return_value = 3
+        req = make_mocked_request(
+            "POST", "/api/anthropic/cooldowns/clear", app=self._app(pool),
+            headers={"Authorization": f"Bearer {ADMIN}"},
+        )
+        resp = await dashboard_api._api_anthropic_cooldowns_clear(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.body)["cooldowns_cleared"], 3)
+        pool.clear_cooldowns.assert_called_once_with()

@@ -18,7 +18,11 @@
     expires_at: number | null; has_refresh_token: boolean
   }
 
+  // A parked key: upstream rate-limited it and the pool is turning requests away.
+  type Cooldown = { key_id: string; model: string | null; seconds_left: number }
+
   let keys = $state<AKey[]>([])
+  let cooldowns = $state<Cooldown[]>([])
   let error = $state('')
   let busy = $state(false)
 
@@ -48,9 +52,26 @@
   let renameValue = $state('')
 
   async function load() {
-    try { keys = (await apiGet<{ keys: AKey[] }>('/api/anthropic/keys')).keys }
+    try {
+      const r = await apiGet<{ keys: AKey[]; cooldowns?: Cooldown[] }>('/api/anthropic/keys')
+      keys = r.keys
+      cooldowns = r.cooldowns ?? []
+    }
     catch (e) { error = String(e) }
   }
+
+  function keyName(id: string): string {
+    const k = keys.find(k => k.id === id)
+    return k?.name || id.slice(0, 12)
+  }
+  function fmtLeft(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`
+    const m = Math.floor(seconds / 60)
+    if (m < 60) return `${m}m ${seconds % 60}s`
+    return `${Math.floor(m / 60)}h ${m % 60}m`
+  }
+  const clearCooldowns = () =>
+    act(() => apiPost('/api/anthropic/cooldowns/clear'))
 
   function isOn(k: AKey): boolean {
     return k.status === 'active' || k.status === 'low_balance'
@@ -238,6 +259,11 @@
   }
 
   onMount(load)
+
+  // The banner shows a live countdown, so refresh it while anything is parked —
+  // and only then, so an idle dashboard keeps polling nothing.
+  const tick = setInterval(() => { if (cooldowns.length) load() }, 15000)
+  onDestroy(() => clearInterval(tick))
 </script>
 
 {#if !oauthState}
@@ -278,6 +304,26 @@
 {/if}
 
 {#if error}<p class="err">{error}</p>{/if}
+
+{#if cooldowns.length}
+  <div class="cooldowns">
+    <div class="cooldowns-body">
+      <strong class="warn">Rate-limited — the pool is turning requests away.</strong>
+      <ul class="cooldown-list">
+        {#each cooldowns as c}
+          <li><code>{c.model ?? 'every model'}</code> on {keyName(c.key_id)} — {fmtLeft(c.seconds_left)} left</li>
+        {/each}
+      </ul>
+      <span class="muted small">
+        The wait is upstream's own retry-after, clamped to one hour — so a limit that resets
+        further out re-arms a fresh hour every hour. Clearing asks upstream again instead of
+        sitting out the clamp; it buys no quota, and if the limit still stands the next
+        request simply re-arms it.
+      </span>
+    </div>
+    <button type="button" onclick={clearCooldowns} disabled={busy}>Clear cooldowns</button>
+  </div>
+{/if}
 
 {#if showApiForm}
   <form class="scope-editor" onsubmit={submitApiKey}>
@@ -422,4 +468,12 @@
   .scope-row { display: flex; align-items: center; gap: 8px; }
   .scope-row.disabled { opacity: 0.55; }
   .warn { color: #b45309; }
+  .cooldowns {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+    margin: 12px 0; padding: 12px; max-width: 720px;
+    border: 1px solid #fcd34d; border-radius: 6px; background: #fffbeb;
+  }
+  .cooldowns-body { display: flex; flex-direction: column; gap: 6px; }
+  .cooldowns button { flex: none; }
+  .cooldown-list { margin: 0; padding-left: 18px; font-size: 13px; }
 </style>

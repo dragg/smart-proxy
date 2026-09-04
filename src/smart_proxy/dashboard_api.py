@@ -279,7 +279,11 @@ async def _api_anthropic_keys(request: web.Request) -> web.Response:
         for r in rows
         if r.get("status") != "deleted"
     ]
-    return web.json_response({"keys": keys})
+    # Parked keys look "active" in the table while every request against them is
+    # turned away, so the cooldown state ships alongside the rows that show it.
+    pool = request.app.get("anthropic_pool")
+    cooldowns = pool.cooldown_snapshot() if pool is not None else []
+    return web.json_response({"keys": keys, "cooldowns": cooldowns})
 
 
 async def _api_anthropic_oauth_start(request: web.Request) -> web.Response:
@@ -680,6 +684,22 @@ async def _api_reload(request: web.Request) -> web.Response:
     return web.json_response({"status": "reloaded", "active": pool.available})
 
 
+async def _api_anthropic_cooldowns_clear(request: web.Request) -> web.Response:
+    """Drop every rate-limit cooldown so the next request retries upstream now.
+
+    Deliberately all-or-nothing rather than per-model: the operator's question is
+    "has the limit lifted yet", and a key-level cooldown blocks every model
+    anyway, so clearing one model alone would usually be a no-op.
+    """
+    if not _action_authorized(request):
+        return _admin_required(request)
+    pool = request.app.get("anthropic_pool")
+    if pool is None:
+        return web.json_response({"error": "pool unavailable"}, status=500)
+    cleared = pool.clear_cooldowns()
+    return web.json_response({"status": "cleared", "cooldowns_cleared": cleared})
+
+
 async def _api_key_active(request: web.Request) -> web.Response:
     if not _action_authorized(request):
         return _admin_required(request)
@@ -822,6 +842,7 @@ def register_dashboard_api(
     app.router.add_get("/api/oauth/usage/history", _api_oauth_history)
     app.router.add_get("/api/openai-compat/stats", _api_compat_stats)
     app.router.add_post("/api/reload", _api_reload)
+    app.router.add_post("/api/anthropic/cooldowns/clear", _api_anthropic_cooldowns_clear)
     app.router.add_post("/api/keys/active", _api_key_active)
     app.router.add_post("/api/keys/limits", _api_key_limits)
 

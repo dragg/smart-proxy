@@ -29,6 +29,7 @@ def _pool(valid: str = "sp-team"):
     pool = MagicMock()
     pool.check_auth.side_effect = lambda t: t == valid
     pool.is_proxy_key.side_effect = lambda t: t == valid
+    pool.cooldown_snapshot.return_value = []
     pool.reload = AsyncMock()
     return pool
 

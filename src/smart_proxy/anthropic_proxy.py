@@ -741,6 +741,55 @@ class AnthropicKeyPool:
             self._cooldowns[key.key_id] = deadline
             logger.warning("Key %s cooled down for %ds", key.key_id[:12], cd)
 
+    def cooldown_snapshot(self) -> list[dict]:
+        """Currently parked keys with seconds left, soonest first.
+
+        Read-only view for the dashboard: without it an operator sees a key
+        marked active while every request against it is being turned away.
+        """
+        now = time.monotonic()
+        parked: list[dict] = []
+        for key_id, deadline in self._cooldowns.items():
+            if deadline > now:
+                parked.append({"key_id": key_id, "model": None, "seconds_left": int(deadline - now) + 1})
+        for (key_id, model), deadline in self._model_cooldowns.items():
+            if deadline > now:
+                parked.append({"key_id": key_id, "model": model, "seconds_left": int(deadline - now) + 1})
+        parked.sort(key=lambda entry: entry["seconds_left"])
+        return parked
+
+    def clear_cooldowns(self, *, model: str | None = None) -> int:
+        """Drop rate-limit cooldowns so the next request reaches upstream at once.
+
+        Deadlines come from upstream's ``retry-after`` but are clamped to
+        ``_MAX_COOLDOWN_SECONDS``, so a limit that resets hours out re-arms a
+        fresh hour every hour and the wait never visibly shrinks. This is the
+        operator's way to ask upstream whether the real limit has lifted instead
+        of sitting out our own clamp. It buys no quota: if the limit still
+        stands, the next attempt simply re-arms the cooldown.
+
+        Refresh backoff and deactivations are deliberately left alone — those
+        guard the OAuth refresh path, where retrying too eagerly risks burning a
+        single-use refresh token and bricking the key.
+        """
+        if model is None:
+            dropped = len(self._cooldowns) + len(self._model_cooldowns)
+            self._cooldowns.clear()
+            self._model_cooldowns.clear()
+        else:
+            stale = [pair for pair in self._model_cooldowns if pair[1] == model]
+            for pair in stale:
+                self._model_cooldowns.pop(pair, None)
+            # A key-level cooldown blocks every model, so it has to go too or
+            # clearing "just this model" would not actually free the key.
+            dropped = len(stale) + len(self._cooldowns)
+            self._cooldowns.clear()
+        if dropped:
+            logger.warning(
+                "Cooldowns cleared by operator (model=%s): %d dropped", model or "all", dropped
+            )
+        return dropped
+
     def _defer(self, key: _AnthropicKey, now_mono: float, *, seconds: int = _REFRESH_RETRY_BACKOFF_SECONDS) -> None:
         """Park *refresh* (not the key) briefly after a failure while the access token
         is still valid, so we keep serving it without hammering /token every request."""
@@ -4407,12 +4456,20 @@ async def _reload_handler(request: web.Request) -> web.Response:
     # lowering the floor alone would be overridden by what the proxy learned.
     if request.query.get("reset_claude_code_version"):
         cc_version.reset()
+    # ?clear_cooldowns=1 (optionally &model=<id>) retries a rate-limited key now
+    # instead of waiting out our clamp of upstream's retry-after.
+    cleared = None
+    if request.query.get("clear_cooldowns"):
+        cleared = pool.clear_cooldowns(model=request.query.get("model") or None)
+    payload = {
+        "status": "reloaded",
+        "active": pool.available,
+        "claude_code_version": cc_version.token,
+    }
+    if cleared is not None:
+        payload["cooldowns_cleared"] = cleared
     return web.Response(
-        text=json.dumps({
-            "status": "reloaded",
-            "active": pool.available,
-            "claude_code_version": cc_version.token,
-        }) + "\n",
+        text=json.dumps(payload) + "\n",
         content_type="application/json",
     )
 
