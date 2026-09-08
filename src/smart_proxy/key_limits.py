@@ -42,6 +42,10 @@ LIMIT_KINDS: dict[str, LimitKind] = {
     "daily_usd": LimitKind(id="daily_usd", window_hours=24, label="24h"),
 }
 
+# Fraction of a cap whose crossing is worth announcing early, while there is
+# still time to raise the limit before the consumer starts collecting 429s.
+WARN_FRACTION = 0.8
+
 
 @dataclass(frozen=True)
 class LimitBlock:
@@ -52,6 +56,26 @@ class LimitBlock:
     retry_after: int
     limit_usd: float
     spent_usd: float
+
+
+@dataclass(frozen=True)
+class LimitCrossing:
+    """One request pushed a key past a threshold of its cap.
+
+    Emitted by :meth:`KeyLimiter.add` at the crossing itself rather than on the
+    429 path, so it lands at the moment it happens instead of on every blocked
+    request afterwards. ``level`` is ``"warn"`` (past :data:`WARN_FRACTION`) or
+    ``"exhausted"`` (past the cap).
+    """
+
+    kind: str
+    label: str
+    level: str
+    limit_usd: float
+    spent_usd: float
+    percent: float
+    resets_at: str
+    retry_after: int
 
 
 class KeyLimiter:
@@ -178,10 +202,20 @@ class KeyLimiter:
         model: str,
         usage: tuple[int, ...],
         now: datetime | None = None,
-    ) -> None:
+    ) -> LimitCrossing | None:
         """Add one request's cost. ``usage`` is the 7-tuple from
-        ``extract_usage`` / ``extract_usage_from_sse``."""
-        self._roll_if_needed(now or self._now())
+        ``extract_usage`` / ``extract_usage_from_sse``.
+
+        Returns the threshold this request crossed, or None. Crossings come
+        from the before/after spend of this single call: the next call already
+        starts above the threshold, and a window rollover zeroes spend and
+        re-arms both levels. That is *nearly* once per window -- :meth:`seed`
+        can move the counter backwards mid-window, since the hourly buckets lag
+        the live counter -- so whoever announces these keeps the latch that
+        makes it exactly once.
+        """
+        current = now or self._now()
+        self._roll_if_needed(current)
         padded = tuple(usage) + (0,) * (7 - len(usage))
         cost = calculate_cost(
             model=model,
@@ -194,8 +228,38 @@ class KeyLimiter:
             web_search_requests=int(padded[6] or 0),
             prices=self._prices,
         ).total_cost
-        if cost:
-            self._spent[proxy_key] = self._spent.get(proxy_key, 0.0) + cost
+        if not cost:
+            return None
+        before = self._spent.get(proxy_key, 0.0)
+        after = before + cost
+        self._spent[proxy_key] = after
+        return self._crossing(proxy_key, before, after, current)
+
+    def _crossing(
+        self, proxy_key: str, before: float, after: float, now: datetime
+    ) -> LimitCrossing | None:
+        """The threshold this request stepped over, or None.
+
+        ``exhausted`` is tested first so a single expensive request that clears
+        both levels at once is announced as the block it is, not as a warning.
+        """
+        for kind, amount in (self._limits.get(proxy_key) or {}).items():
+            for level, threshold in (
+                ("exhausted", amount),
+                ("warn", amount * WARN_FRACTION),
+            ):
+                if before < threshold <= after:
+                    return LimitCrossing(
+                        kind=kind,
+                        label=LIMIT_KINDS[kind].label,
+                        level=level,
+                        limit_usd=amount,
+                        spent_usd=after,
+                        percent=round(after / amount * 100, 1),
+                        resets_at=self.window_end(now).astimezone(self._tz).isoformat(),
+                        retry_after=self.retry_after(now),
+                    )
+        return None
 
     # -- configuration --------------------------------------------------
 

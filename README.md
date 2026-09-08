@@ -31,7 +31,7 @@ rate-limited, and records what each key, model and session cost.
   the same pool.
 - **Says something when it breaks.** Telegram alerts for the failures that are
   otherwise silent: a bricked refresh token, a database outage, a background
-  loop that exited.
+  loop that exited, a caller burning through its 24h budget.
 
 **What it is not:** a hosted service, a multi-tenant product, or a legal
 opinion about whether pooling subscription credentials is allowed for your
@@ -199,6 +199,13 @@ refused change answers `403` naming the variable to set.
   answers `429` with the time remaining, and editing the limit takes effect on
   the next request with no restart. `GET /_oauth_usage?key=sp-…` reports the
   same numbers as a `smartproxy_daily_usd` entry in that key's `usage.limits[]`.
+  When Telegram is configured, a limited key announces itself as it goes: 🟡
+  the first time spend crosses 80% of the cap, 🔴 the first time it crosses the
+  cap itself and starts collecting `429`s. Both messages name the consumer, so
+  the alert says whose limit to go raise. Each fires once per window; the
+  rollover re-arms them, and so does raising the cap. Lowering a cap below what
+  a key has already spent blocks it *without* an alert — spend never crosses
+  anything, and you already know, since you just did it.
 
 ### Editable installs only
 

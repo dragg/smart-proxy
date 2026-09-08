@@ -62,7 +62,7 @@ from smart_proxy.db import (
     is_weekly_window_kind,
     parse_allowed_proxy_keys,
 )
-from smart_proxy.key_limits import DEFAULT_WINDOW_TZ, KeyLimiter
+from smart_proxy.key_limits import DEFAULT_WINDOW_TZ, KeyLimiter, LimitCrossing
 from smart_proxy.notifier import AlertThrottle, TelegramNotifier
 from smart_proxy.openai_compat import setup_openai_compat
 from smart_proxy.request_classify import _session_id, _system_text, classify_request
@@ -256,6 +256,80 @@ def _format_refresh_alert(
         f"{prefix} Anthropic refresh temporarily failed — {who}: {code}{status_part}. "
         f"Token still valid for ~{left}, retrying."
     )
+
+
+_SPEND_ALERT_EMOJI = {"warn": "🟡", "exhausted": "🔴"}
+
+
+def _format_spend_alert(caller: str, crossing: LimitCrossing) -> str:
+    """Telegram body for a caller crossing a threshold of its own spend cap.
+
+    ``caller`` is a :func:`_caller_label` string: the alert asks for a decision
+    about a *consumer* -- raise the cap, or go find out what they are running --
+    which needs a name, not a key.
+    """
+    emoji = _SPEND_ALERT_EMOJI.get(crossing.level, "ℹ️")
+    left = _humanize_seconds(crossing.retry_after)
+    spent = (
+        f"spent ${crossing.spent_usd:,.2f} of ${crossing.limit_usd:,.2f} "
+        f"({crossing.percent}%)"
+    )
+    if crossing.level == "exhausted":
+        return (
+            f"{emoji} {_SERVICE_NAME} · {caller} exhausted its {crossing.label} limit\n"
+            f"{spent}\n"
+            f"new requests get 429 for {left}, until {crossing.resets_at}"
+        )
+    return (
+        f"{emoji} {_SERVICE_NAME} · {caller} is approaching its {crossing.label} limit\n"
+        f"{spent}\n"
+        f"resets in {left} ({crossing.resets_at})"
+    )
+
+
+def _alert_spend_threshold(app, proxy_key: str, crossing: LimitCrossing) -> None:
+    """Announce one spend crossing, at most once per key, level and window.
+
+    The latch lives here rather than in :class:`KeyLimiter` because a crossing
+    is derived from a single call's before/after spend, and ``seed`` can move
+    that counter *backwards* mid-window -- it re-reads ``usage_key_hourly``,
+    which lags the live counter by up to a flush interval. A restart that loses
+    the last unflushed seconds, or a ``/_reload``, would otherwise re-announce a
+    threshold the operator has already acted on. Stamping the window *and* the
+    cap keeps the two legitimate re-arms -- the next window, and raising the
+    limit -- firing as they should.
+
+    Never raises: the response this follows has already gone out, and the spend
+    it reports is already counted.
+    """
+    try:
+        notifier = app.get("_notifier")
+        if notifier is None:
+            return
+        announced = app.get("_spend_alert_at")
+        if announced is None:
+            announced = {}
+            app["_spend_alert_at"] = announced
+        slot = (proxy_key, crossing.level)
+        stamp = (crossing.resets_at, crossing.limit_usd)
+        if announced.get(slot) == stamp:
+            return
+        caller = _caller_label_for(app.get("anthropic_pool"), proxy_key)
+        logger.info(
+            "spend %s: caller=%s spent=%.4f limit=%.2f",
+            crossing.level, caller, crossing.spent_usd, crossing.limit_usd,
+        )
+        task = asyncio.create_task(
+            notifier.notify(_format_spend_alert(caller, crossing))
+        )
+        announced[slot] = stamp
+        tasks = app.get("_alert_tasks")
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+    except Exception as exc:
+        # Accounting already succeeded; only the announcement is lost.
+        _alert_failure(app, source="spend threshold alert", exc=exc)
 
 
 def _anthropic_key_from_row(row: dict) -> _AnthropicKey:
@@ -3279,13 +3353,19 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
                 )
                 if limiter is not None:
                     try:
-                        limiter.add(usage_proxy_key, model, usage)
+                        crossing = limiter.add(usage_proxy_key, model, usage)
                     except Exception as exc:
                         # The response is already streamed; never fail it here.
                         logger.exception("spend accounting failed")
                         _alert_failure(
                             request.app, source="per-key spend accounting", exc=exc,
                         )
+                    else:
+                        # Announcing is its own concern: a problem here is not a
+                        # counting bug and must not be reported as one.
+                        if crossing is not None:
+                            _alert_spend_threshold(
+                                request.app, usage_proxy_key, crossing)
 
         if "/v1/messages" in path:
             asyncio.create_task(
@@ -5026,6 +5106,7 @@ async def _on_startup(app: web.Application) -> None:
     app["_notifier"] = notifier
     app["_alert_throttle"] = AlertThrottle()
     app["_alert_tasks"] = set()
+    app["_spend_alert_at"] = {}          # (proxy key, level) -> window already announced
     _ALERT_FALLBACK["_notifier"] = notifier
     _ALERT_FALLBACK["_alert_throttle"] = app["_alert_throttle"]
     _ALERT_FALLBACK["_alert_tasks"] = app["_alert_tasks"]

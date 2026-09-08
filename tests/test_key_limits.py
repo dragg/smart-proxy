@@ -201,5 +201,137 @@ class KindRegistryTests(unittest.TestCase):
         self.assertEqual(LIMIT_KINDS["daily_usd"].window_hours, 24)
 
 
+class ThresholdCrossingTests(unittest.IsolatedAsyncioTestCase):
+    """``add`` reports the moment a key crosses 80% / 100% of its cap.
+
+    200k input tokens of claude-opus-4-5 cost exactly $1.00 ($5/Mtok), so every
+    amount below is expressed as input tokens: 10k = $0.05.
+    """
+
+    async def _limiter(self, tz="UTC"):
+        self._tmp = tempfile.TemporaryDirectory()
+        db = build_database_from_config(database_url="", db_path=f"{self._tmp.name}/k.db")
+        await db.connect()
+        self.addAsyncCleanup(db.close)
+        self._db = db
+        lim = KeyLimiter(db, tz=tz)
+        await lim.load()
+        return lim
+
+    async def asyncTearDown(self):
+        tmp = getattr(self, "_tmp", None)
+        if tmp:
+            tmp.cleanup()
+
+    @staticmethod
+    def _spend(dollars):
+        return (int(round(dollars * 200_000)), 0, 0, 0, 0, 0, 0)
+
+    def _add(self, lim, dollars, *, key="sp-a", now=None):
+        return lim.add(key, "claude-opus-4-5", self._spend(dollars), now=now)
+
+    async def test_no_crossing_while_below_the_warning_threshold(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self.assertIsNone(self._add(lim, 0.79))
+
+    async def test_crossing_the_warning_threshold_is_reported(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        crossing = self._add(lim, 0.85)
+        self.assertIsNotNone(crossing)
+        self.assertEqual(crossing.level, "warn")
+        self.assertEqual(crossing.kind, "daily_usd")
+
+    async def test_warning_is_reported_once_while_it_stays_crossed(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self._add(lim, 0.85)
+        self.assertIsNone(self._add(lim, 0.05))
+        self.assertIsNone(self._add(lim, 0.05))
+
+    async def test_reaching_the_limit_is_reported_as_exhausted(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self._add(lim, 0.85)
+        crossing = self._add(lim, 0.20)
+        self.assertIsNotNone(crossing)
+        self.assertEqual(crossing.level, "exhausted")
+
+    async def test_one_request_can_jump_straight_to_exhausted(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        crossing = self._add(lim, 1.20)
+        self.assertIsNotNone(crossing)
+        self.assertEqual(crossing.level, "exhausted")
+
+    async def test_a_key_without_a_limit_never_crosses(self):
+        lim = await self._limiter()
+        self.assertIsNone(self._add(lim, 500.0))
+
+    async def test_an_unpriced_model_cannot_cross(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 0.01)
+        self.assertIsNone(
+            lim.add("sp-a", "totally-unknown-model", (1_000_000, 0, 0, 0, 0, 0, 0))
+        )
+
+    async def test_window_rollover_re_arms_both_thresholds(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        day1 = _utc(2026, 7, 30, 12)
+        self.assertEqual(self._add(lim, 1.20, now=day1).level, "exhausted")
+        day2 = _utc(2026, 7, 31, 12)
+        self.assertEqual(self._add(lim, 0.85, now=day2).level, "warn")
+
+    async def test_raising_the_limit_re_arms_the_warning(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self.assertEqual(self._add(lim, 1.20).level, "exhausted")
+        await lim.set_limit("sp-a", "daily_usd", 5.0)   # $1.20 spent is now 24%
+        self.assertEqual(self._add(lim, 3.05).level, "warn")   # $4.25 = 85%
+
+    async def test_spend_restored_by_seed_is_not_re_announced(self):
+        """A restart re-seeds an already-warned key; it must stay quiet."""
+        self._tmp = tempfile.TemporaryDirectory()
+        db = build_database_from_config(database_url="", db_path=f"{self._tmp.name}/k.db")
+        await db.connect()
+        self.addAsyncCleanup(db.close)
+        await db.upsert_usage_hourly_batch([
+            ("2026-07-30T09", "sp-a", "claude-opus-4-5", 170_000, 0, 0, 0, 0, 0, 0, 1),
+        ])
+        await db.set_proxy_key_limit("sp-a", "daily_usd", 1.0)
+        lim = KeyLimiter(db, tz="UTC")
+        await lim.load()
+        now = _utc(2026, 7, 30, 12)
+        await lim.seed(now=now)                      # $0.85 spent = 85%
+        self.assertIsNone(self._add(lim, 0.05, now=now))
+
+    async def test_a_warning_does_not_block_the_caller(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self.assertEqual(self._add(lim, 0.85).level, "warn")
+        self.assertIsNone(lim.check("sp-a"))
+
+    async def test_the_exhausted_alert_and_the_429_gate_agree(self):
+        """The message promises 429s from here on, so the gate must be shut:
+        a ``>`` on either side of the boundary would make one of them lie."""
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        self.assertEqual(self._add(lim, 1.0).level, "exhausted")   # exactly the cap
+        self.assertIsNotNone(lim.check("sp-a"))
+
+    async def test_crossing_carries_what_the_alert_needs(self):
+        lim = await self._limiter()
+        await lim.set_limit("sp-a", "daily_usd", 1.0)
+        crossing = self._add(lim, 0.85, now=_utc(2026, 7, 30, 12))
+        self.assertEqual(crossing.label, "24h")
+        self.assertAlmostEqual(crossing.limit_usd, 1.0)
+        self.assertAlmostEqual(crossing.spent_usd, 0.85, places=6)
+        self.assertAlmostEqual(crossing.percent, 85.0, places=1)
+        self.assertEqual(crossing.retry_after, 12 * 3600)
+        self.assertTrue(crossing.resets_at.startswith("2026-07-31T00:00"))
+
+
 if __name__ == "__main__":
     unittest.main()

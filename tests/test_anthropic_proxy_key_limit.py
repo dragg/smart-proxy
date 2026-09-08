@@ -1,6 +1,6 @@
 # tests/test_anthropic_proxy_key_limit.py
 from __future__ import annotations
-import json, sys, unittest
+import asyncio, json, sys, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,7 +11,16 @@ from aiohttp.test_utils import make_mocked_request
 
 from smart_proxy import anthropic_proxy
 from smart_proxy.claude_code_identity import ClaudeCodeVersion, DEFAULT_CLAUDE_CODE_VERSION
-from smart_proxy.key_limits import LimitBlock
+from smart_proxy.key_limits import LimitBlock, LimitCrossing
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def notify(self, text: str) -> bool:
+        self.messages.append(text)
+        return True
 
 
 class BillablePathTests(unittest.TestCase):
@@ -165,6 +174,9 @@ class _FakePool:
     def check_auth(self, token: str) -> bool:
         return bool(token)
 
+    def proxy_key_name(self, proxy_key: str) -> str:
+        return {"sp-test": "Acme webapp"}.get(proxy_key, "")
+
     def pick(self, model: str | None = None, *, fallback_for: str | None = None):
         return self._keys[0]
 
@@ -254,6 +266,61 @@ class SpendAddedOnSuccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added_key, checked_key)
         self.assertEqual(added_model, recorded_model)
         self.assertEqual(tuple(added_usage)[:2], (10, 5))
+
+
+class SpendAlertWiringTests(unittest.IsolatedAsyncioTestCase):
+    """A crossing reported by limiter.add() must leave the handler as a Telegram
+    message. The detection itself is covered in test_key_limits; what is easy to
+    get wrong here is the wiring -- returning the crossing and dropping it on the
+    floor looks identical in every other test."""
+
+    async def _run(self, crossing):
+        body = json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "ping"}],
+        }).encode()
+        limiter = MagicMock()
+        limiter.check.return_value = None
+        limiter.add.return_value = crossing
+        notifier = _RecordingNotifier()
+        app = {
+            "anthropic_pool": _FakePool(anthropic_proxy._AnthropicKey(
+                key_id="key-abc", key_type="api_key", status="active",
+                api_key="sk-ant-test", access_token=None, refresh_token=None,
+                client_id="client-id", expires_at=None,
+            )),
+            "claude_code_version": ClaudeCodeVersion(DEFAULT_CLAUDE_CODE_VERSION),
+            "http_client": _FakeHttpClient(_FakeUpstreamJsonResponse(
+                b'{"usage":{"input_tokens":10,"output_tokens":5}}')),
+            "usage_tracker": MagicMock(),
+            "key_limiter": limiter,
+            "db": _FakeDb(),
+            "_notifier": notifier,
+            "_alert_tasks": set(),
+        }
+        req = _FakeRequest(
+            app=app, headers={"Authorization": "Bearer sp-test"}, body=body,
+        )
+        with patch("smart_proxy.anthropic_proxy.web.StreamResponse", _FakeStreamResponse):
+            resp = await anthropic_proxy._proxy_handler(req)
+        await asyncio.gather(*list(app["_alert_tasks"]), return_exceptions=True)
+        return resp, notifier.messages
+
+    async def test_exhausting_the_cap_alerts_with_the_consumer_name(self):
+        resp, messages = await self._run(LimitCrossing(
+            kind="daily_usd", label="24h", level="exhausted",
+            limit_usd=50.0, spent_usd=50.4, percent=100.8,
+            resets_at="2026-09-09T00:00:00+02:00", retry_after=3600,
+        ))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(len(messages), 1)
+        # The name proves the handler looked the alert up under the key it billed.
+        self.assertIn("Acme webapp", messages[0])
+        self.assertIn("exhausted", messages[0])
+
+    async def test_no_crossing_means_no_message(self):
+        _, messages = await self._run(None)
+        self.assertEqual(messages, [])
 
 
 class ResyncLimiterTests(unittest.IsolatedAsyncioTestCase):
