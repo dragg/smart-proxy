@@ -10,6 +10,11 @@ header { display: flex; align-items: center; gap: 24px;
 nav button { border: 0; background: none; padding: 8px 10px; cursor: pointer;
   color: var(--muted); font-size: 14px; }
 nav button.active { color: var(--ink); font-weight: 600; }
+/* Not `nav button`: this one sits outside <nav>, pushed to the far end of the
+   flex header by the auto margin. */
+header .logout { margin-left: auto; border: 0; background: none; padding: 8px 10px;
+  cursor: pointer; color: var(--muted); font-size: 14px; }
+header .logout:hover { color: var(--ink); }
 main { padding: 24px; }
 .pad { padding: 24px; }
 .err { color: #b91c1c; }

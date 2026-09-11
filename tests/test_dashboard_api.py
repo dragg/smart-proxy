@@ -12,6 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from smart_proxy import dashboard_api
@@ -144,6 +145,58 @@ class ApiSessionTests(unittest.IsolatedAsyncioTestCase):
         req.json = AsyncMock(return_value={"token": "nope"})
         resp = await dashboard_api._api_session(req)
         self.assertEqual(resp.status, 401)
+
+
+class ApiSessionLogoutTests(unittest.IsolatedAsyncioTestCase):
+    """Signing out of the dashboard.
+
+    The cookie *is* the credential -- there is no server-side session -- so
+    this forgets it in this browser and revokes nothing.
+    """
+
+    def _req(self, **kwargs):
+        return make_mocked_request(
+            "DELETE", "/api/session",
+            app={"anthropic_pool": _pool(), "dashboard_secret": ADMIN},
+            **kwargs,
+        )
+
+    async def test_clears_the_cookie_without_any_credential(self) -> None:
+        # A session whose token has already gone stale -- an expired admin
+        # secret, a deactivated sp- key -- must still be able to clear it.
+        resp = await dashboard_api._api_session_delete(self._req())
+        self.assertEqual(resp.status, 200)
+        set_cookie = resp.headers.get("Set-Cookie", "").lower()
+        self.assertIn("dash_token=", set_cookie)
+        self.assertIn("max-age=0", set_cookie)
+
+    async def test_delete_matches_the_attributes_that_identify_the_cookie(self) -> None:
+        # A browser matches a cookie by (name, domain, path) alone. Login sets
+        # Path=/ and no Domain; a logout that disagrees on either stores a
+        # second, already-dead cookie and leaves the live one signed in.
+        resp = await dashboard_api._api_session_delete(self._req())
+        set_cookie = resp.headers.get("Set-Cookie", "").lower()
+        self.assertIn("path=/", set_cookie)
+        self.assertNotIn("domain=", set_cookie)
+
+    async def test_non_admin_proxy_key_session_can_sign_out(self) -> None:
+        # An sp- key signs in read-only. Gating logout on the admin secret
+        # would leave exactly those sessions with no way out.
+        resp = await dashboard_api._api_session_delete(
+            self._req(headers={"Cookie": "dash_token=sp-team"})
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertIn("max-age=0", resp.headers.get("Set-Cookie", "").lower())
+
+    def test_registered_as_delete_on_api_session(self) -> None:
+        # DELETE rather than POST /api/session/logout: an HTML form can only
+        # GET or POST, so a cross-site forced logout would need a preflighted
+        # fetch that this app never answers.
+        app = web.Application()
+        dashboard_api.register_dashboard_api(app)
+        routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        self.assertIn(("DELETE", "/api/session"), routes)
+        self.assertIn(("POST", "/api/session"), routes)
 
 
 class ApiUsageKeysTests(unittest.IsolatedAsyncioTestCase):

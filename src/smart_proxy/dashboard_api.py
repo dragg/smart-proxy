@@ -65,6 +65,30 @@ def _dashboard_token(request: web.Request, *, allow_query: bool = True) -> str:
     return token
 
 
+def _session_cookie_header(value: str, max_age: int) -> str:
+    """One ``Set-Cookie`` value for the dashboard session cookie.
+
+    Sign-in and sign-out MUST agree here. A browser identifies a cookie by
+    (name, domain, path) alone -- not by HttpOnly, SameSite or Max-Age -- so a
+    logout whose ``path`` differed, or which added a ``Domain``, would store a
+    second, already-dead cookie and leave the live one signed in.
+
+    Built with :class:`http.cookies.SimpleCookie` and returned as a plain
+    string rather than applied via ``resp.set_cookie()``: aiohttp only copies
+    ``resp.cookies`` into ``resp.headers`` at send time (``Response._start``),
+    so ``set_cookie()`` alone leaves ``resp.headers`` untouched for callers
+    (and tests) inspecting the Response object before it is actually sent.
+    """
+    cookie: SimpleCookie = SimpleCookie()
+    cookie[_COOKIE_NAME] = value
+    morsel = cookie[_COOKIE_NAME]
+    morsel["httponly"] = True
+    morsel["samesite"] = "Lax"
+    morsel["max-age"] = str(max_age)
+    morsel["path"] = "/"
+    return morsel.output(header="").strip()
+
+
 def _dashboard_secret(request: web.Request) -> str:
     return str(request.app.get("dashboard_secret", "") or "").strip()
 
@@ -154,21 +178,33 @@ async def _api_session(request: web.Request) -> web.Response:
             status=401,
         )
     resp = web.json_response({"ok": True, "admin": admin})
-    # Build the Set-Cookie value with http.cookies.SimpleCookie and add it to
-    # resp.headers directly (rather than via resp.set_cookie()). aiohttp only
-    # copies resp.cookies into resp.headers at send time (Response._start),
-    # so resp.set_cookie() alone leaves resp.headers untouched for callers
-    # (and tests) inspecting the Response object before it's actually sent.
-    cookie: SimpleCookie = SimpleCookie()
-    cookie[_COOKIE_NAME] = token
-    morsel = cookie[_COOKIE_NAME]
-    morsel["httponly"] = True
-    morsel["samesite"] = "Lax"
     # An admin session carries the secret itself, so it expires in hours; a
     # read-only proxy key is revocable and may stay for a month.
-    morsel["max-age"] = str(12 * 3600 if admin else 30 * 24 * 3600)
-    morsel["path"] = "/"
-    resp.headers.add("Set-Cookie", morsel.output(header="").strip())
+    max_age = 12 * 3600 if admin else 30 * 24 * 3600
+    resp.headers.add("Set-Cookie", _session_cookie_header(token, max_age))
+    return resp
+
+
+async def _api_session_delete(request: web.Request) -> web.Response:
+    """Sign out: clear the dashboard session cookie.
+
+    Deliberately ungated. The cookie *is* the credential -- there is no
+    server-side session -- so this forgets it in this browser and revokes
+    nothing: an ``sp-`` key stays usable until it is deactivated on the Keys
+    tab, and the admin secret until ``ANTHROPIC_PROXY_DASHBOARD_SECRET`` is
+    changed and the proxy restarted. Demanding a valid credential to sign out
+    would strand exactly the sessions that most need to: an ``sp-`` key
+    session, which may administer nothing, and one whose token has already
+    gone stale.
+
+    DELETE rather than POST because the effect rides on the *response*'s
+    Set-Cookie, which ``SameSite=Lax`` does not gate: an auto-submitted
+    cross-site form would otherwise be a working forced-logout. An HTML form
+    can only GET or POST, and a cross-site ``fetch`` with DELETE needs a CORS
+    preflight this app never answers.
+    """
+    resp = web.json_response({"ok": True})
+    resp.headers.add("Set-Cookie", _session_cookie_header("", 0))
     return resp
 
 
@@ -860,6 +896,7 @@ def register_dashboard_api(
 ) -> None:
     """Register /api/* routes and /_app/ SPA static serving."""
     app.router.add_post("/api/session", _api_session)
+    app.router.add_delete("/api/session", _api_session_delete)
     app.router.add_get("/api/usage", _api_usage)
     app.router.add_get("/api/usage/kinds", _api_usage_kinds)
     app.router.add_get("/api/sessions", _api_sessions)

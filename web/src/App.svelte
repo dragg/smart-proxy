@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { apiGet, login, Unauthorized } from './lib/api'
+  import { apiGet, login, logout, Unauthorized } from './lib/api'
   import UsageView from './views/UsageView.svelte'
   import WindowsView from './views/WindowsView.svelte'
   import CompatView from './views/CompatView.svelte'
@@ -37,6 +37,7 @@
   let authed = $state(false)
   let token = $state('')
   let loginError = $state('')
+  let logoutError = $state('')
   let adminSecretConfigured = $state<boolean | null>(null)
   let tab = $state<Tab>(tabFromHash())
 
@@ -73,9 +74,33 @@
 
   onMount(() => {
     const onHash = () => { tab = tabFromHash() }
+    const onUnauthorized = () => { authed = false }
     window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
+    window.addEventListener('sp:unauthorized', onUnauthorized)
+    return () => {
+      window.removeEventListener('hashchange', onHash)
+      window.removeEventListener('sp:unauthorized', onUnauthorized)
+    }
   })
+
+  async function doLogout() {
+    logoutError = ''
+    try {
+      await logout()
+    } catch {
+      // The request never landed, so the cookie is still live. Falling through
+      // to probe() would show the login form over a session that is still
+      // signed in, and a reload would undo it -- probe() cannot tell the two
+      // apart, because a dropped connection and a 401 reach the same catch.
+      logoutError = 'Sign-out failed — you are still signed in.'
+      return
+    }
+    // Re-probe rather than assuming: where a reverse proxy injects an
+    // Authorization header the cookie was never the credential (the header
+    // wins in _dashboard_token), and claiming to be signed out would be a lie
+    // a page reload immediately exposes.
+    await probe()
+  }
 
   async function doLogin(e: Event) {
     e.preventDefault()
@@ -116,7 +141,9 @@
       <button class:active={tab === 'traffic'} onclick={() => setTab('traffic')}>Traffic</button>
       <button class:active={tab === 'setup'} onclick={() => setTab('setup')}>Setup</button>
     </nav>
+    <button class="logout" onclick={doLogout}>Log out</button>
   </header>
+  {#if logoutError}<p class="pad err">{logoutError}</p>{/if}
   <main>
     {#if tab === 'usage'}<UsageView />
     {:else if tab === 'windows'}<WindowsView />

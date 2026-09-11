@@ -20,6 +20,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof body?.admin_secret_configured === 'boolean') {
         e.adminSecretConfigured = body.admin_secret_configured
       }
+      // Announce that the cookie is gone so the shell falls back to the login
+      // form. Without this, a tab whose session ended elsewhere — signed out
+      // in another tab, or the 12h admin cookie simply expiring — keeps
+      // rendering a dashboard whose every request answers "unauthorized".
+      //
+      // Not for the sign-in endpoint: a 401 there is the expected answer to a
+      // wrong password, not a dead session, and tearing the shell down over it
+      // would sign out a session that is still perfectly valid the moment
+      // login() is ever called from an authed state.
+      if (path !== '/api/session') window.dispatchEvent(new Event('sp:unauthorized'))
       throw e
     }
     const e = new Forbidden(body?.error ?? 'forbidden')
@@ -52,4 +62,10 @@ export function apiPost<T>(path: string, body?: unknown): Promise<T> {
 
 export function login(token: string): Promise<{ ok: boolean; admin: boolean }> {
   return apiPost('/api/session', { token })
+}
+
+// Forgets the session cookie in this browser. It revokes nothing: the sp- key
+// stays valid until deactivated, the admin secret until it is rotated.
+export function logout(): Promise<{ ok: boolean }> {
+  return req<{ ok: boolean }>('/api/session', { method: 'DELETE' })
 }

@@ -181,6 +181,13 @@ from a URL and expires from the session after 12 hours. Leave it unset and the
 dashboard is read-only for everyone: the proxy says so at startup, and each
 refused change answers `403` naming the variable to set.
 
+**Signing out** clears that session cookie and nothing else. The cookie *is*
+the credential — there is no server-side session — so it forgets the login in
+this browser and revokes nothing: an `sp-…` key stays usable until you
+deactivate it on the Keys tab, and the secret until you change it and restart.
+A one-click `?token=sp-…` link also outlives the sign-out in browser history
+and bookmarks. Treat it as leaving, not as locking the door behind you.
+
 - **Usage / Traffic / Windows / Compat** — cost per key, model, request kind
   and session; OAuth quota windows; OpenAI-compatible traffic broken out on its
   own tab.
