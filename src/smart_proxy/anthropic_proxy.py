@@ -83,7 +83,9 @@ TOKEN_URL = os.environ.get(
     "https://platform.claude.com/v1/oauth/token",
 )
 
-_UPSTREAM_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
+# pool=: waiting this long for a free connection means the pool is full of
+# something that will not come back -- fail fast rather than queue for 600s.
+_UPSTREAM_TIMEOUT = httpx.Timeout(600.0, connect=30.0, pool=15.0)
 _REFRESH_BUFFER_MS = 5 * 60 * 1000  # refresh 5 min before expiry
 # Upper bound for any cooldown. Anthropic's weekly (seven_day) limits return a
 # retry-after of up to ~25h; honouring that verbatim would park a model (or key)
@@ -127,6 +129,16 @@ _STRIP_RESPONSE_HEADERS = frozenset({
 # ---------------------------------------------------------------------------
 # OAuth token refresh
 # ---------------------------------------------------------------------------
+
+def _oauth_client(app: web.Application) -> httpx.AsyncClient:
+    """The client for token rotation, kept off the data path's pool.
+
+    Refresh tokens are single-use: a refresh that cannot even get a connection
+    counts as a transient failure, and enough of those deactivate a healthy key.
+    Falls back to the shared client for apps assembled without one (tests).
+    """
+    return app.get("oauth_http_client") or app["http_client"]
+
 
 async def _refresh_oauth_token(
     client: httpx.AsyncClient,
@@ -2556,8 +2568,10 @@ async def _classify_unsuccessful_response(
         response.headers.get("content-type", "application/json").partition(";")[0].strip()
         or "application/json"
     )
-    resp_body = await response.aread()
-    await response.aclose()
+    try:
+        resp_body = await response.aread()
+    finally:
+        await response.aclose()
     error_type, error_message, parsed_body = _parse_error_details(resp_body)
     request_id = _extract_response_request_id(dict(response.headers), parsed_body)
 
@@ -2921,6 +2935,51 @@ def _is_billable_path(method: str, path: str) -> bool:
 
 
 async def _proxy_handler(request: web.Request) -> web.StreamResponse:
+    """Serve one proxied request, then close every upstream response it opened.
+
+    A streamed httpx response holds its pool slot until it is read to EOF or
+    closed. A half-read SSE body comes back only when the GC happens to collect
+    its generator; a body nobody started reading never comes back at all.
+    On 2026-10-07 callers that hung up while we waited on Anthropic made
+    ``prepare()`` raise before the code that closes ``r``; after three weeks all
+    100 slots were gone and every request queued 600s for one. Closing here, on
+    the way out, covers every path past ``send`` instead of each one by hand.
+    """
+    open_responses: list[httpx.Response] = []
+    try:
+        return await _proxy_attempts(request, open_responses)
+    finally:
+        for upstream in open_responses:
+            try:
+                await upstream.aclose()
+            except Exception as exc:
+                logger.warning("Upstream response did not close cleanly: %r", exc)
+
+
+async def _send_upstream(
+    client: httpx.AsyncClient,
+    req: httpx.Request,
+    open_responses: list[httpx.Response],
+) -> httpx.Response:
+    """The only way an attempt talks to upstream: whatever it opens gets closed."""
+    r = await client.send(req, stream=True)
+    open_responses.append(r)
+    return r
+
+
+def _upstream_pool_summary(client: httpx.AsyncClient) -> str:
+    """'N/M upstream connections busy', or '' when httpx internals moved."""
+    try:
+        connections = client._transport._pool.connections  # type: ignore[attr-defined]
+        busy = sum(1 for conn in connections if not conn.is_idle())
+        return f"{busy}/{len(connections)} upstream connections busy"
+    except Exception:
+        return ""
+
+
+async def _proxy_attempts(
+    request: web.Request, open_responses: list[httpx.Response],
+) -> web.StreamResponse:
     pool: AnthropicKeyPool = request.app["anthropic_pool"]
     client: httpx.AsyncClient = request.app["http_client"]
     tracker: UsageTracker | None = request.app.get("usage_tracker")
@@ -3050,7 +3109,7 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
         tried_key_ids.add(key.key_id)
         effective_token = await pool.ensure_valid_token(
             key,
-            client,
+            _oauth_client(request.app),
             audit_op_id=op_id,
             audit_source="proxy_request",
             audit_path=path,
@@ -3118,10 +3177,36 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
                 headers=fwd,
                 content=attempt_body if attempt_body else None,
             )
-            r = await client.send(req, stream=True)
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            r = await _send_upstream(client, req, open_responses)
+        except httpx.PoolTimeout as exc:
+            # Our own pool is full, not upstream or the key: another attempt
+            # would only queue on the same pool again. Fail now and loudly.
+            caller = _caller_label_for(pool, usage_proxy_key)
+            pool_summary = _upstream_pool_summary(client)
+            logger.error(
+                "Upstream connection pool exhausted — %s %s for %s (%s)",
+                request.method, path, caller, pool_summary or "pool state unknown",
+            )
+            _alert_failure(
+                request.app, source="upstream connection pool exhausted", exc=exc,
+                detail=f"{caller}: {request.method} {path}\n{pool_summary}".rstrip(),
+            )
+            return web.Response(
+                status=503,
+                headers={"retry-after": "5"},
+                body=json.dumps({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "Proxy is overloaded, retry shortly"},
+                }).encode(),
+                content_type="application/json",
+            )
+        except httpx.TransportError as exc:
+            # Broader than connect/timeout on purpose: "Server disconnected
+            # without sending a response" is a stale keep-alive connection that
+            # upstream never read from, and it used to escape as a 500.
             logger.warning(
-                "Transport error with key %s: %s", key.key_id[:12], exc
+                "Transport error with key %s: %s: %s",
+                key.key_id[:12], type(exc).__name__, exc,
             )
             attempt_failures.append(
                 _AttemptFailure(f"transport: {type(exc).__name__}", ours=True)
@@ -3220,9 +3305,22 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
         stream_aiter = None
         initial_stream_buf = b""
         if is_stream:
-            initial_stream_buf, stream_aiter, stream_state = await _buffer_stream_until_commit(
-                r, timeout=request.app.get("precommit_timeout", 10.0)
-            )
+            try:
+                initial_stream_buf, stream_aiter, stream_state = await _buffer_stream_until_commit(
+                    r, timeout=request.app.get("precommit_timeout", 10.0)
+                )
+            except httpx.TransportError as exc:
+                # Nothing has reached the client yet, so this is as retryable as
+                # a failure at send -- not a 500 for the middleware to report.
+                await r.aclose()
+                logger.warning(
+                    "Transport error before commit with key %s: %s: %s",
+                    key.key_id[:12], type(exc).__name__, exc,
+                )
+                attempt_failures.append(
+                    _AttemptFailure(f"transport before commit: {type(exc).__name__}", ours=True)
+                )
+                continue
             if stream_state == "error":
                 err_type, err_msg = await _handle_stream_failure_before_commit(
                     kind="error",
@@ -3295,11 +3393,13 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
                 continue
             stream_resp.headers[name] = value
 
-        await stream_resp.prepare(request)
         head_buf = initial_stream_buf
         tail_buf = initial_stream_buf[-_TAIL_BUF_MAX:] if is_stream else b""
         resp_body_buf = b""
         try:
+            # Inside the try: prepare() is where a caller who already hung up
+            # surfaces, and ``r`` must be closed then too.
+            await stream_resp.prepare(request)
             if is_stream:
                 if initial_stream_buf:
                     await stream_resp.write(initial_stream_buf)
@@ -3995,7 +4095,7 @@ async def _oauth_usage_handler(request: web.Request) -> web.Response:
     seconds (``ANTHROPIC_OAUTH_USAGE_CACHE_SECONDS``), separately per ``include_inactive``.
     """
     pool: AnthropicKeyPool = request.app["anthropic_pool"]
-    client: httpx.AsyncClient = request.app["http_client"]
+    client: httpx.AsyncClient = _oauth_client(request.app)
     db: Database = request.app["db"]
 
     if request.app.get("oauth_usage_require_auth") and not pool.check_auth(
@@ -4411,7 +4511,7 @@ async def _oauth_exchange_and_store(
             f"(sessions expire after {_OAUTH_LOGIN_SESSION_TTL_SEC // 60} minutes).",
         )
 
-    client: httpx.AsyncClient = app["http_client"]
+    client: httpx.AsyncClient = _oauth_client(app)
     try:
         data = await exchange_authorization_code(
             client,
@@ -4822,7 +4922,7 @@ async def _run_oauth_smoke_pass(app: web.Application, window_name: str) -> None:
             key = _anthropic_key_from_row(row)
         was_expired = key.is_expired()
         effective_token = await pool.ensure_valid_token(
-            key, client, audit_op_id=op_id, audit_source="scheduled_smoke",
+            key, _oauth_client(app), audit_op_id=op_id, audit_source="scheduled_smoke",
             audit_path="/v1/messages", audit_model=_SMOKE_MODEL,
         )
         if effective_token == pool._REFRESH_BLOCKED:
@@ -4851,8 +4951,11 @@ async def _run_oauth_smoke_pass(app: web.Application, window_name: str) -> None:
         )
         try:
             response = await client.send(req, stream=True)
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
-            logger.warning("Smoke %s transport error key %s: %s", window_name, key.key_id[:12], exc)
+        except httpx.TransportError as exc:
+            logger.warning(
+                "Smoke %s transport error key %s: %s: %s",
+                window_name, key.key_id[:12], type(exc).__name__, exc,
+            )
             continue
 
         if response.status_code == 200:
@@ -4917,7 +5020,7 @@ async def _standby_keepwarm_step(app: web.Application) -> float:
     ``pool.reload()`` swaps instances, and refreshing a detached copy would burn a
     single-use refresh token invisibly to the pooled object."""
     pool: AnthropicKeyPool = app["anthropic_pool"]
-    client: httpx.AsyncClient = app["http_client"]
+    client: httpx.AsyncClient = _oauth_client(app)
     buffer_ms: int = app["standby_keepwarm_buffer_ms"]
 
     standbys = [k for k in pool._keys if k.role == "standby" and k.status != "inactive"]
@@ -5101,6 +5204,16 @@ async def _on_startup(app: web.Application) -> None:
     app["key_limiter"] = limiter
 
     app["http_client"] = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
+    # Token rotation and alerting get pools of their own: when the data path
+    # exhausted the shared one (2026-10-07), the alert about it died of the same
+    # PoolTimeout, and refreshes stalled until keys were close to deactivation.
+    app["oauth_http_client"] = httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=30.0, pool=10.0),
+        # Room for the /_oauth_usage fan-out (one usage GET per key, callers
+        # poll it in bursts) without making a refresh wait behind it.
+        limits=httpx.Limits(max_connections=10),
+    )
+    app["alert_http_client"] = httpx.AsyncClient(limits=httpx.Limits(max_connections=4))
     notifier = _build_notifier(app)
     pool._notifier = notifier
     app["_notifier"] = notifier
@@ -5175,7 +5288,9 @@ def _build_notifier(app: web.Application) -> TelegramNotifier | None:
     chat_id = str(app.get("telegram_chat_id") or "").strip()
     if token and chat_id:
         logger.info("Telegram alerts enabled")
-        return TelegramNotifier(token, chat_id, app["http_client"])
+        return TelegramNotifier(
+            token, chat_id, app.get("alert_http_client") or app["http_client"],
+        )
     # Loud on the negative path on purpose: an unconfigured notifier makes every
     # alert in the process a silent no-op, which is indistinguishable from
     # "nothing has gone wrong" right up until an outage goes unreported.
@@ -5205,9 +5320,10 @@ async def _on_cleanup(app: web.Application) -> None:
     # second app in the same process (tests) never inherits a closed notifier.
     _ALERT_FALLBACK.clear()
 
-    client: httpx.AsyncClient | None = app.get("http_client")
-    if client:
-        await client.aclose()
+    for client_name in ("http_client", "oauth_http_client", "alert_http_client"):
+        client: httpx.AsyncClient | None = app.get(client_name)
+        if client:
+            await client.aclose()
     if db:
         await db.close()
 

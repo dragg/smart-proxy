@@ -659,9 +659,9 @@ async def _api_anthropic_key_refresh(request: web.Request) -> web.Response:
     # Lazy imports: anthropic_proxy imports this module; anthropic_oauth is
     # imported lazily too so tests can patch smart_proxy.anthropic_oauth.<fn>.
     import smart_proxy.anthropic_oauth as anthropic_oauth
-    from smart_proxy.anthropic_proxy import TOKEN_URL, UPSTREAM_BASE
+    from smart_proxy.anthropic_proxy import TOKEN_URL, UPSTREAM_BASE, _oauth_client
 
-    client = request.app["http_client"]
+    client = _oauth_client(request.app)
     try:
         new_token, new_expires, rotated_refresh = await anthropic_oauth.refresh_oauth_token(
             client,
@@ -705,10 +705,10 @@ def _truthy(request: web.Request, name: str) -> bool:
 async def _api_oauth_usage(request: web.Request) -> web.Response:
     if not _dashboard_authorized(request):
         return _unauthorized()
-    from smart_proxy.anthropic_proxy import _build_oauth_usage_payload
+    from smart_proxy.anthropic_proxy import _build_oauth_usage_payload, _oauth_client
 
     pool = request.app["anthropic_pool"]
-    client = request.app["http_client"]
+    client = _oauth_client(request.app)
     db = request.app["db"]
     keys, last_failure = await _build_oauth_usage_payload(
         pool, client, db, include_inactive_oauth=_truthy(request, "include_inactive")
