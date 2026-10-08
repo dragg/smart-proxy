@@ -127,9 +127,48 @@ class ModelPricesTests(unittest.TestCase):
 
                     sonnet5 = by_prefix["claude-sonnet-5"]
                     self.assertEqual(sonnet5["provider"], "anthropic")
-                    self.assertEqual(sonnet5["input_price"], 3.0)
-                    self.assertEqual(sonnet5["output_price"], 15.0)
-                    self.assertEqual(sonnet5["cache_write_1h_price"], 6.0)
+                    self.assertEqual(sonnet5["input_price"], 2.0)
+                    self.assertEqual(sonnet5["output_price"], 10.0)
+                    self.assertEqual(sonnet5["cache_write_1h_price"], 4.0)
+
+                    for prefix in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"):
+                        self.assertEqual(by_prefix[prefix]["provider"], "anthropic")
+                finally:
+                    await db.close()
+
+        asyncio.run(run())
+
+    def test_reseeding_corrects_untouched_superseded_default(self) -> None:
+        """claude-sonnet-5 first shipped at $3/$15; the real price is $2/$10.
+
+        A row still holding the old default exactly was never customized, so
+        re-seeding moves it to the corrected default.
+        """
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                db_path = str(Path(td) / "test.db")
+                db = await connect_test_database(sqlite_fallback_path=db_path)
+                try:
+                    await db.upsert_model_price(
+                        model_prefix="claude-sonnet-5",
+                        provider="anthropic",
+                        input_price=3.0,
+                        output_price=15.0,
+                        cache_read_price=0.3,
+                        cache_write_5m_price=3.75,
+                        cache_write_1h_price=6.0,
+                    )
+
+                    await db._seed_model_prices()
+
+                    rows = await db.get_all_model_prices()
+                    sonnet5 = {row["model_prefix"]: row for row in rows}["claude-sonnet-5"]
+                    self.assertEqual(sonnet5["input_price"], 2.0)
+                    self.assertEqual(sonnet5["output_price"], 10.0)
+                    self.assertEqual(sonnet5["cache_read_price"], 0.2)
+                    self.assertEqual(sonnet5["cache_write_5m_price"], 2.5)
+                    self.assertEqual(sonnet5["cache_write_1h_price"], 4.0)
                 finally:
                     await db.close()
 
@@ -191,7 +230,48 @@ class PrefixMatchingTests(unittest.TestCase):
         breakdown = calculate_cost("claude-sonnet-5", input_tokens=1_000_000, output_tokens=0)
         self.assertFalse(breakdown.unknown_pricing)
         self.assertEqual(breakdown.matched_prefix, "claude-sonnet-5")
-        self.assertAlmostEqual(breakdown.input_cost, 3.0, places=6)
+        self.assertAlmostEqual(breakdown.input_cost, 2.0, places=6)
+
+    def test_claude_5_5_family_priced_exactly(self) -> None:
+        # (model, input, output, cache_read, cache_write_5m, cache_write_1h) per MTok
+        cases = (
+            ("claude-opus-5-5", 4.00, 20.00, 0.20, 5.00, 8.00),
+            ("claude-sonnet-5-5", 2.00, 10.00, 0.10, 2.50, 4.00),
+            ("claude-haiku-5-5", 0.10, 0.50, 0.01, 0.125, 0.20),
+            ("claude-fable-5-1", 10.00, 50.00, 0.25, 12.50, 20.00),
+            ("claude-mythos-5-1", 10.00, 50.00, 0.25, 12.50, 20.00),
+        )
+        for model, inp, out, read, w5, w1 in cases:
+            with self.subTest(model=model):
+                b = calculate_cost(
+                    model,
+                    input_tokens=1_000_000,
+                    output_tokens=1_000_000,
+                    cache_read_tokens=1_000_000,
+                    cache_creation_5m_tokens=1_000_000,
+                    cache_creation_1h_tokens=1_000_000,
+                )
+                self.assertEqual(b.matched_prefix, model)
+                self.assertAlmostEqual(b.input_cost, inp, places=6)
+                self.assertAlmostEqual(b.output_cost, out, places=6)
+                self.assertAlmostEqual(b.cache_read_cost, read, places=6)
+                self.assertAlmostEqual(b.cache_write_5m_cost, w5, places=6)
+                self.assertAlmostEqual(b.cache_write_1h_cost, w1, places=6)
+
+    def test_previous_generation_not_priced_like_cheaper_5_5(self) -> None:
+        # Adding claude-opus-5-5 ($4) must not reprice Opus 5 ($5) or a dated
+        # Opus 5.5 snapshot onto the wrong entry.
+        self.assertEqual(calculate_cost("claude-opus-5", 1_000_000, 0).input_cost, 5.0)
+        snap = calculate_cost("claude-opus-5-5-20261001", 1_000_000, 0)
+        self.assertEqual(snap.matched_prefix, "claude-opus-5-5")
+        self.assertAlmostEqual(snap.input_cost, 4.0, places=6)
+
+    def test_dotted_5_5_alias_prices_like_dashed(self) -> None:
+        for dotted, dashed in (("claude-opus-5.5", "claude-opus-5-5"),
+                               ("claude-sonnet-5.5", "claude-sonnet-5-5"),
+                               ("claude-haiku-5.5", "claude-haiku-5-5")):
+            with self.subTest(model=dotted):
+                self.assertEqual(calculate_cost(dotted, 1_000_000, 0).matched_prefix, dashed)
 
     def test_legacy_bare_opus_4_and_dated_snapshot_keep_old_price(self) -> None:
         for model in ("claude-opus-4", "claude-opus-4-20250514"):
@@ -202,8 +282,9 @@ class PrefixMatchingTests(unittest.TestCase):
 
     def test_unrecognized_future_opus_version_falls_back_to_latest_known_opus(self) -> None:
         # "claude-opus-4-99" doesn't exist in the price table. It must price
-        # like the newest known Opus entry ($5/$25), not the old bare
-        # "claude-opus-4" entry ($15/$75).
+        # like the newest known Opus 4.x entry ($5/$25) -- not the old bare
+        # "claude-opus-4" entry ($15/$75), and not a later generation
+        # ("claude-opus-5-5", $4/$20) it doesn't belong to.
         breakdown = calculate_cost(
             "claude-opus-4-99",
             input_tokens=1_000_000,
@@ -211,9 +292,13 @@ class PrefixMatchingTests(unittest.TestCase):
             cache_creation_1h_tokens=1_000_000,
         )
         self.assertFalse(breakdown.unknown_pricing)
-        self.assertNotEqual(breakdown.matched_prefix, "claude-opus-4")
+        self.assertEqual(breakdown.matched_prefix, "claude-opus-4-8")
         self.assertAlmostEqual(breakdown.input_cost, 5.0, places=6)
         self.assertAlmostEqual(breakdown.cache_write_1h_cost, 10.0, places=6)
+
+    def test_unrecognized_future_version_uses_nearest_older_known_entry(self) -> None:
+        self.assertEqual(calculate_cost("claude-opus-5-7", 1_000_000, 0).matched_prefix, "claude-opus-5-5")
+        self.assertEqual(calculate_cost("claude-sonnet-6", 1_000_000, 0).matched_prefix, "claude-sonnet-5-5")
 
     def test_completely_unknown_model_is_still_unknown_pricing(self) -> None:
         breakdown = calculate_cost("some-made-up-model", input_tokens=1_000, output_tokens=1_000)

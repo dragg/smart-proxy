@@ -1254,10 +1254,35 @@ class Database:
         seeded in the past. `seed_model_prices` uses INSERT OR IGNORE /
         ON CONFLICT DO NOTHING, so it never touches a prefix that's already
         present, including one a user customized via `price set`.
+
+        A row still holding a superseded default exactly is moved to the
+        corrected default; see `_SUPERSEDED_DEFAULT_PRICES` in usage.py.
         """
-        from smart_proxy.usage import build_default_price_rows
+        from smart_proxy.usage import build_default_price_rows, build_superseded_price_rows
 
         await self.seed_model_prices(build_default_price_rows())
+
+        existing = {row["model_prefix"]: row for row in await self.get_all_model_prices()}
+        price_columns = (
+            "input_price", "output_price", "cache_read_price",
+            "cache_write_5m_price", "cache_write_1h_price",
+        )
+        for old, new in build_superseded_price_rows():
+            row = existing.get(old[0])
+            if row is None or any(
+                row[col] is None or abs(float(row[col]) - value) > 1e-9
+                for col, value in zip(price_columns, old[2:])
+            ):
+                continue
+            await self.upsert_model_price(
+                model_prefix=new[0],
+                provider=new[1],
+                input_price=new[2],
+                output_price=new[3],
+                cache_read_price=new[4],
+                cache_write_5m_price=new[5],
+                cache_write_1h_price=new[6],
+            )
 
     async def close(self) -> None:
         if self._db:

@@ -50,8 +50,12 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro":   (1.25, 10.00),
     "gemini-3-pro":     (1.25, 10.00),
     # Anthropic
+    "claude-fable-5-1":       (10.00, 50.00),
+    "claude-mythos-5-1":      (10.00, 50.00),
     "claude-fable-5":         (10.00, 50.00),
     "claude-mythos-5":        (10.00, 50.00),
+    "claude-opus-5-5":        (4.00, 20.00),
+    "claude-opus-5":          (5.00, 25.00),
     "claude-opus-4-8":        (5.00, 25.00),
     "claude-opus-4-7":        (5.00, 25.00),
     "claude-opus-4-6":        (5.00, 25.00),
@@ -60,7 +64,8 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-4.5":        (5.00, 25.00),
     "claude-opus-4.1":        (15.00, 75.00),
     "claude-opus-4":          (15.00, 75.00),
-    "claude-sonnet-5":        (3.00, 15.00),
+    "claude-sonnet-5-5":      (2.00, 10.00),
+    "claude-sonnet-5":        (2.00, 10.00),
     "claude-sonnet-4-6":      (3.00, 15.00),
     "claude-sonnet-4-5":      (3.00, 15.00),
     "claude-sonnet-4.6":      (3.00, 15.00),
@@ -69,6 +74,10 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-3.7":      (3.00, 15.00),
     "claude-3.5-sonnet":      (3.00, 15.00),
     "claude-3-5-sonnet":      (3.00, 15.00),
+    # Haiku 5.5 is $0.50/$2.50 for prompts over 100K tokens. Costs are priced
+    # from aggregated usage rows, where per-request prompt length is gone, so
+    # the <=100K rate is used throughout.
+    "claude-haiku-5-5":       (0.10, 0.50),
     "claude-haiku-4-5":       (1.00, 5.00),
     "claude-haiku-4.5":       (1.00, 5.00),
     "claude-haiku-4":         (1.00, 5.00),
@@ -79,9 +88,15 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
 
 # Anthropic prompt caching prices:
 # (input, output, cache_read, cache_write_5m, cache_write_1h)
+# Cache reads are 0.1x input except Fable/Mythos 5.1 (0.025x) and
+# Opus/Sonnet 5.5 (0.05x).
 _DEFAULT_ANTHROPIC_CACHE_PRICES: dict[str, tuple[float, float, float, float, float]] = {
+    "claude-fable-5-1":  (10.00, 50.00, 0.25, 12.50, 20.00),
+    "claude-mythos-5-1": (10.00, 50.00, 0.25, 12.50, 20.00),
     "claude-fable-5":    (10.00, 50.00, 1.00, 12.50, 20.00),
     "claude-mythos-5":   (10.00, 50.00, 1.00, 12.50, 20.00),
+    "claude-opus-5-5":   (4.00, 20.00, 0.20, 5.00, 8.00),
+    "claude-opus-5":     (5.00, 25.00, 0.50, 6.25, 10.00),
     "claude-opus-4-8":   (5.00, 25.00, 0.50, 6.25, 10.00),
     "claude-opus-4-7":   (5.00, 25.00, 0.50, 6.25, 10.00),
     "claude-opus-4-6":   (5.00, 25.00, 0.50, 6.25, 10.00),
@@ -90,7 +105,8 @@ _DEFAULT_ANTHROPIC_CACHE_PRICES: dict[str, tuple[float, float, float, float, flo
     "claude-opus-4.5":   (5.00, 25.00, 0.50, 6.25, 10.00),
     "claude-opus-4.1":   (15.00, 75.00, 1.50, 18.75, 30.00),
     "claude-opus-4":     (15.00, 75.00, 1.50, 18.75, 30.00),
-    "claude-sonnet-5":   (3.00, 15.00, 0.30, 3.75, 6.00),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.10, 2.50, 4.00),
+    "claude-sonnet-5":   (2.00, 10.00, 0.20, 2.50, 4.00),
     "claude-sonnet-4-6": (3.00, 15.00, 0.30, 3.75, 6.00),
     "claude-sonnet-4-5": (3.00, 15.00, 0.30, 3.75, 6.00),
     "claude-sonnet-4.6": (3.00, 15.00, 0.30, 3.75, 6.00),
@@ -99,12 +115,20 @@ _DEFAULT_ANTHROPIC_CACHE_PRICES: dict[str, tuple[float, float, float, float, flo
     "claude-sonnet-3.7": (3.00, 15.00, 0.30, 3.75, 6.00),
     "claude-3.5-sonnet": (3.00, 15.00, 0.30, 3.75, 6.00),
     "claude-3-5-sonnet": (3.00, 15.00, 0.30, 3.75, 6.00),
+    "claude-haiku-5-5":  (0.10, 0.50, 0.01, 0.125, 0.20),
     "claude-haiku-4-5":  (1.00, 5.00, 0.10, 1.25, 2.00),
     "claude-haiku-4.5":  (1.00, 5.00, 0.10, 1.25, 2.00),
     "claude-haiku-4":    (1.00, 5.00, 0.10, 1.25, 2.00),
     "claude-3.5-haiku":  (0.80, 4.00, 0.08, 1.00, 1.60),
     "claude-3-5-haiku":  (0.80, 4.00, 0.08, 1.00, 1.60),
     "claude-haiku-3":    (0.25, 1.25, 0.03, 0.30, 0.50),
+}
+
+# Defaults that shipped wrong and were corrected later. A model_prices row that
+# still holds the old value exactly was never customized, so re-seeding moves
+# it to the current default; any other value is a `price set` and is kept.
+_SUPERSEDED_DEFAULT_PRICES: dict[str, tuple[float, float, float, float, float]] = {
+    "claude-sonnet-5": (3.00, 15.00, 0.30, 3.75, 6.00),
 }
 
 # Backward-compatible aliases for callers/tests that import these names.
@@ -157,6 +181,15 @@ def build_default_price_rows() -> list[tuple]:
         else:
             rows.append((prefix, provider, inp_price, out_price, None, None, None))
     return rows
+
+
+def build_superseded_price_rows() -> list[tuple[tuple, tuple]]:
+    """Return (old_row, current_row) pairs in db.seed_model_prices() row shape."""
+    current = {row[0]: row for row in build_default_price_rows()}
+    return [
+        ((prefix, "anthropic", *old), current[prefix])
+        for prefix, old in _SUPERSEDED_DEFAULT_PRICES.items()
+    ]
 
 
 def build_price_lookup(db_rows: list[dict]) -> dict:
@@ -233,9 +266,10 @@ def _resolve_matched_prefix(model: str, prefixes: list[str]) -> str | None:
        an unseen version number ("claude-opus-4" must not swallow
        "claude-opus-4-8").
     3. Family fallback: for an unrecognized Claude model, use the newest
-       known price entry in the same tier (e.g. "claude-opus-4-8" prices like
-       the latest known Opus entry) rather than falling through to an
-       unrelated generic/legacy prefix.
+       known price entry in the same tier that is not newer than the model
+       ("claude-opus-4-99" prices like "claude-opus-4-8", not the later and
+       cheaper "claude-opus-5-5"), or the newest entry in the tier when every
+       known entry is newer. Never an unrelated generic/legacy prefix.
     """
     if model in prefixes:
         return model
@@ -247,18 +281,17 @@ def _resolve_matched_prefix(model: str, prefixes: list[str]) -> str | None:
     target = _claude_family_version(model)
     if target is None:
         return None
-    target_family = target[0]
+    target_family, target_version = target
 
-    best_prefix: str | None = None
-    best_version: tuple[int, ...] | None = None
+    family: list[tuple[tuple[int, ...], str]] = []
     for prefix in prefixes:
         candidate = _claude_family_version(prefix)
-        if candidate is None or candidate[0] != target_family:
-            continue
-        if best_version is None or candidate[1] > best_version:
-            best_version = candidate[1]
-            best_prefix = prefix
-    return best_prefix
+        if candidate is not None and candidate[0] == target_family:
+            family.append((candidate[1], prefix))
+    if not family:
+        return None
+    not_newer = [entry for entry in family if entry[0] <= target_version]
+    return max(not_newer or family)[1]
 
 
 def calculate_cost(
