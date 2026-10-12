@@ -312,6 +312,32 @@ to your host.
    sudo journalctl -u smart-proxy -f         # follow logs
    ```
 
+7. **Put nginx in front** (TLS, public hostname). Raise the request body limit:
+   nginx defaults `client_max_body_size` to **1m**, and a Claude Code request
+   carries the whole conversation, so a long session crosses 1 MB long before
+   Anthropic's own 32 MB cap. Turn buffering off so streamed responses reach the
+   client as they arrive, and keep the timeouts above the longest turn:
+
+   ```nginx
+   server {
+       listen 443 ssl;
+       server_name proxy.example.com;
+
+       client_max_body_size 100M;   # default 1m rejects long sessions with 413
+
+       location / {
+           proxy_pass http://127.0.0.1:8090;
+           proxy_http_version 1.1;
+           proxy_set_header Host $host;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto $scheme;
+           proxy_buffering off;
+           proxy_read_timeout 3600s;
+           proxy_send_timeout 3600s;
+       }
+   }
+   ```
+
 After a deploy that only changed keys, reload the pool without a restart via
 `POST /_reload` (or the dashboard's **Reload** button).
 
@@ -503,6 +529,7 @@ backfill, so hour data starts at the first flush after this feature shipped).
 |---|---|---|
 | `/_app/` returns `503 dashboard not built` | The SPA is missing from `src/smart_proxy/static/app/`, or you installed non-editable | `cd web && npm ci && npm run build`, then `pip install -e .`. See [Editable installs only](#editable-installs-only) — a plain `pip install .` can never serve it |
 | Proxy answers `401` | The caller's `sp-...` key is missing, wrong, or deactivated | `smart-proxy proxy-key add <name>` for a new one, or check the Keys tab. The key must arrive as `Authorization: Bearer` or `x-api-key` — a `?key=` query parameter is not read on `/v1/*`, and there is no localhost exemption there either |
+| Claude Code says `Request too large (max 32MB)` on a small session, and `/compact` fails the same way | Claude Code prints that text for **any** HTTP 413 that isn't Anthropic's JSON error, so the 32MB figure means nothing here. Usually nginx in front of the proxy is still on its default `client_max_body_size 1m`. The proxy's own log shows no request, because nginx rejected it first | Set `client_max_body_size 100M;` in the server block and reload nginx (see [Deployment](#deployment), step 7). To confirm, check the `errorDetails` field of the error entry in the session's `~/.claude/projects/…/*.jsonl`: it holds the raw response, here an nginx `413 Request Entity Too Large` page |
 | `429` mentioning a 24h limit | The caller's own spend cap, not Anthropic's | Raise or clear the cap on the Keys tab; it applies from the next request, no restart |
 | `429` without that message | Anthropic rate-limited the upstream account | Expected. That key goes on a per-model cooldown and the request retries on the next one. If every account is cooling down, the caller sees the upstream 429 |
 | An account flipped to inactive with `invalid_grant` | Its refresh token is dead. Anthropic rotates the refresh token on **every** refresh and retires the old one immediately, so a lost or raced refresh bricks the row | Re-authenticate with `smart-proxy anthropic-login --name <label>`. It inserts a **new** row rather than reviving the dead one, so delete the old one afterwards (Anthropic tab, or `anthropic-key deactivate <id-prefix>`). Never run two instances against the same account row |

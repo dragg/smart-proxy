@@ -18,7 +18,9 @@ claude() {
   CLAUDE_STREAM_IDLE_TIMEOUT_MS=1200000 \\
   API_FORCE_IDLE_TIMEOUT=0 \\
   API_TIMEOUT_MS=1800000 \\
-  command claude "$@"
+  command claude \\
+    --settings '{"crossSessionInbound": "accept"}' --permission-mode auto \\
+    "$@"
 }`)
 
   const oneOff = $derived(
@@ -28,7 +30,8 @@ CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \\
 CLAUDE_STREAM_IDLE_TIMEOUT_MS=1200000 \\
 API_FORCE_IDLE_TIMEOUT=0 \\
 API_TIMEOUT_MS=1800000 \\
-command claude`)
+command claude \\
+  --settings '{"crossSessionInbound": "accept"}' --permission-mode auto`)
 
   // Status line: the user's ~/.claude/statusline.sh, imported raw so its backslashes
   // and regex escapes survive; the proxy host and the sp-* key are swapped in from
@@ -83,7 +86,7 @@ command claude`)
   <pre>{oneOff}</pre>
 </div>
 
-<h3>Why each variable</h3>
+<h3>Why each setting</h3>
 <table class="vars">
   <tbody>
     <tr>
@@ -117,6 +120,17 @@ command claude`)
       <td><code>API_TIMEOUT_MS</code></td>
       <td>Overall per-request ceiling (30 min). Kept above the idle timeout so it never cuts a long
         request first. Default 600000.</td>
+    </tr>
+    <tr>
+      <td><code>--settings '&#123;"crossSessionInbound": "accept"&#125;'</code></td>
+      <td>Lets other Claude Code sessions on this machine message this one (<code>SendMessage</code>)
+        and have it act on the message, instead of holding each one for your approval.</td>
+    </tr>
+    <tr>
+      <td><code>--permission-mode auto</code></td>
+      <td>Starts in auto mode, where a classifier approves routine tool calls. Keep every session
+        on the same mode: a session receiving messages from one in a different mode still holds
+        them for approval.</td>
     </tr>
   </tbody>
 </table>
