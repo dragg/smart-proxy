@@ -86,6 +86,11 @@ TOKEN_URL = os.environ.get(
 # pool=: waiting this long for a free connection means the pool is full of
 # something that will not come back -- fail fast rather than queue for 600s.
 _UPSTREAM_TIMEOUT = httpx.Timeout(600.0, connect=30.0, pool=15.0)
+# Once a streamed request has been committed early (see _EarlyCommit), how often
+# an SSE comment goes out while upstream is still silent. Cloudflare's floor is
+# 100s without a byte; this keeps every gap far below it.
+_EARLY_COMMIT_KEEPALIVE_SECONDS = 15.0
+_EARLY_COMMIT_KEEPALIVE = b": keepalive\n\n"
 _REFRESH_BUFFER_MS = 5 * 60 * 1000  # refresh 5 min before expiry
 # Upper bound for any cooldown. Anthropic's weekly (seven_day) limits return a
 # retry-after of up to ~25h; honouring that verbatim would park a model (or key)
@@ -2254,6 +2259,145 @@ async def _buffer_stream_until_commit(
             return initial_buf, aiter, "eof"
 
 
+class _EarlyCommit:
+    """Answer a slow streamed request with 200 + SSE keep-alives before upstream does.
+
+    Anthropic sends its response headers together with ``message_start``, and
+    only once prefill is done. A large uncached prompt can take longer than the
+    100-120s Cloudflare waits for a first byte, so the client got a 524 while
+    upstream was still working (2026-10-19: ~509K tokens of Opus after a 16-min
+    idle). Past ``after_seconds`` of silence the proxy commits a 200
+    ``text/event-stream`` itself and writes ``: keepalive`` comments, which
+    every SSE parser ignores, until upstream answers.
+
+    Only real bytes commit the request to an upstream answer: retries, key
+    rotation and the pre-commit stream checks keep working underneath, because
+    so far the client has seen nothing but comments. The price is that the
+    final answer can no longer carry a status or upstream headers, so a
+    failure after the commit ends as an ``event: error`` (``finish_with``).
+
+    Single writer: keep-alives are written only from ``wait()``, in the handler
+    task, so there is no lock and no background task to outlive the request.
+    """
+
+    def __init__(self, request: web.Request, after_seconds: float) -> None:
+        self._request = request
+        self._after = after_seconds
+        self._armed = False
+        self._started = time.monotonic()
+        self._last_write = 0.0
+        self.response: web.StreamResponse | None = None
+        # Set once the stream got its EOF: past that, nothing may be written,
+        # not even an error (aiohttp raises on write() after write_eof()).
+        self.ended = False
+
+    @property
+    def committed(self) -> bool:
+        return self.response is not None
+
+    def arm(self, method: str, path: str, req_body: object) -> None:
+        """Enable for streamed /v1/messages, the only shape whose client reads SSE.
+
+        Not for the OpenAI-compat loopback: it maps the real upstream status
+        into its own response and would read a 200 as success.
+        """
+        self._armed = (
+            self._after > 0
+            and method == "POST"
+            and path.endswith("/v1/messages")
+            and self._request.headers.get("x-smart-proxy-openai-compat") != "1"
+            and isinstance(req_body, dict)
+            and req_body.get("stream") is True
+        )
+
+    async def wait(self, awaitable):  # noqa: ANN001, ANN201
+        """Await ``awaitable``, keeping the client warm while it is slow.
+
+        If the client turns out to be gone, the wait is cancelled and the
+        ``ConnectionResetError`` from the keep-alive write propagates -- the
+        same hang-up the first write of a normal response would have reported.
+        """
+        if not self._armed:
+            return await awaitable
+        task = asyncio.ensure_future(awaitable)
+        # A send abandoned here may still finish with an exception nobody
+        # awaits; retrieve it so asyncio does not log it as never retrieved.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=self._until_next_write())
+                if done:
+                    return task.result()
+                await self._keepalive()
+        finally:
+            if not task.done():
+                task.cancel()
+
+    def _until_next_write(self) -> float:
+        now = time.monotonic()
+        if self.response is None:
+            return max(self._started + self._after - now, 0.0)
+        return max(self._last_write + _EARLY_COMMIT_KEEPALIVE_SECONDS - now, 0.0)
+
+    async def _keepalive(self) -> None:
+        if self.response is None:
+            resp = web.StreamResponse(status=200)
+            resp.headers["content-type"] = "text/event-stream; charset=utf-8"
+            resp.headers["cache-control"] = "no-cache"
+            await resp.prepare(self._request)
+            self.response = resp
+            logger.info(
+                "Upstream silent for %.0fs; committed 200 SSE early to keep the client warm",
+                time.monotonic() - self._started,
+            )
+        await self.response.write(_EARLY_COMMIT_KEEPALIVE)
+        self._last_write = time.monotonic()
+
+    async def finish_with(self, status: int, body: bytes, headers) -> web.StreamResponse:  # noqa: ANN001
+        """End the committed stream with the error a status response would have carried.
+
+        Claude Code reads a status-less stream error by its nested ``error.type``:
+        ``overloaded_error`` and ``rate_limit_error`` are retried, anything else
+        is shown as is. So every 5xx -- upstream's or our own 502 / 503 -- is
+        sent as ``overloaded_error``, which is how the SDK would have treated
+        the status. No top-level ``message``: the SDK would show it instead of
+        the error.
+        """
+        assert self.response is not None
+        if self.ended:
+            # The stream already got its EOF (a failure in the bookkeeping
+            # after it); the client has its answer and cannot get another.
+            return self.response
+        err_type, err_msg, parsed = _parse_error_details(body)
+        if not err_type and parsed is not None and isinstance(parsed.get("error"), str):
+            err_msg = parsed["error"]
+        if status >= 500:
+            err_type = "overloaded_error"
+        elif status == 429:
+            err_type = "rate_limit_error"
+        elif not err_type:
+            err_type = {
+                401: "authentication_error",
+                403: "permission_error",
+                404: "not_found_error",
+                413: "request_too_large",
+            }.get(status, "invalid_request_error" if 400 <= status < 500 else "api_error")
+        payload: dict = {
+            "type": "error",
+            "error": {"type": err_type, "message": err_msg or f"HTTP {status}"},
+        }
+        request_id = _extract_response_request_id(headers or {}, parsed)
+        if request_id:
+            payload["request_id"] = request_id
+        logger.info("Early-committed stream ends with %d as %s", status, err_type)
+        await self.response.write(
+            b"event: error\ndata: " + json.dumps(payload).encode() + b"\n\n"
+        )
+        self.ended = True
+        await self.response.write_eof()
+        return self.response
+
+
 def _extract_sse_error_details(buf: bytes) -> tuple[str, str]:
     """Pull (error_type, error_message) out of a buffered SSE error event.
 
@@ -2946,8 +3090,39 @@ async def _proxy_handler(request: web.Request) -> web.StreamResponse:
     the way out, covers every path past ``send`` instead of each one by hand.
     """
     open_responses: list[httpx.Response] = []
+    early = _EarlyCommit(request, request.app.get("early_commit_seconds", 60.0))
     try:
-        return await _proxy_attempts(request, open_responses)
+        try:
+            resp = await _proxy_attempts(request, open_responses, early)
+        except ConnectionResetError:
+            raise
+        except web.HTTPException as exc:
+            if not early.committed:
+                raise
+            # aiohttp would prepare it on the same connection, i.e. write a
+            # second status line into the stream.
+            return await early.finish_with(exc.status, exc.body or b"", exc.headers)
+        except Exception as exc:
+            if not early.committed:
+                raise
+            # Past the early 200 aiohttp has no 500 left to send -- a second
+            # response would land as garbage inside the stream -- and the
+            # middleware never sees this exception, so report it here.
+            _alert_failure(
+                request.app, source=f"{request.method} {request.path}", exc=exc,
+            )
+            return await early.finish_with(500, b"", {})
+        if early.committed and resp is not early.response:
+            # Every early return of _proxy_attempts (429s, overloads, the final
+            # 502, an upstream 4xx) is a plain status response, built for a
+            # client that has not been answered yet. Send what it says instead.
+            body = resp.body if isinstance(resp, web.Response) else b""
+            return await early.finish_with(
+                resp.status,
+                body if isinstance(body, (bytes, bytearray)) else b"",
+                resp.headers,
+            )
+        return resp
     finally:
         for upstream in open_responses:
             try:
@@ -2978,7 +3153,9 @@ def _upstream_pool_summary(client: httpx.AsyncClient) -> str:
 
 
 async def _proxy_attempts(
-    request: web.Request, open_responses: list[httpx.Response],
+    request: web.Request,
+    open_responses: list[httpx.Response],
+    early: _EarlyCommit,
 ) -> web.StreamResponse:
     pool: AnthropicKeyPool = request.app["anthropic_pool"]
     client: httpx.AsyncClient = request.app["http_client"]
@@ -3044,6 +3221,7 @@ async def _proxy_attempts(
     model = _extract_model(body)
     req_body = _safe_json_obj(body)
     logger.info(">>> %s %s  bytes=%d  model=%s", request.method, path, len(body), model)
+    early.arm(request.method, path, req_body)
 
     fallback_for, fallback_denied = _fallback_admission(
         request, req_body, usage_proxy_key, limiter
@@ -3177,7 +3355,10 @@ async def _proxy_attempts(
                 headers=fwd,
                 content=attempt_body if attempt_body else None,
             )
-            r = await _send_upstream(client, req, open_responses)
+            # Prefill happens in here: no headers until it is done. Token
+            # refresh above is deliberately not wrapped -- a hang-up must
+            # never cancel a single-use refresh-token rotation half way.
+            r = await early.wait(_send_upstream(client, req, open_responses))
         except httpx.PoolTimeout as exc:
             # Our own pool is full, not upstream or the key: another attempt
             # would only queue on the same pool again. Fail now and loudly.
@@ -3387,19 +3568,43 @@ async def _proxy_attempts(
                 )
                 continue
 
-        stream_resp = web.StreamResponse(status=r.status_code)
-        for name, value in r.headers.items():
-            if name.lower() in _STRIP_RESPONSE_HEADERS:
-                continue
-            stream_resp.headers[name] = value
+        if early.committed:
+            if not (200 <= r.status_code < 300 and is_stream):
+                if 200 <= r.status_code < 300:
+                    logger.warning(
+                        "Upstream answered a streamed request with %s after the "
+                        "early commit; reporting it as an error",
+                        r.headers.get("content-type", "no content-type"),
+                    )
+                # An upstream status nothing above classified (400, 404, 413...)
+                # would be piped through as raw JSON inside our 200 stream;
+                # hand it back as a status response for the handler to turn
+                # into an SSE error.
+                return web.Response(
+                    status=r.status_code,
+                    body=await r.aread(),
+                    headers={
+                        name: value for name, value in r.headers.items()
+                        if name.lower() not in _STRIP_RESPONSE_HEADERS
+                    },
+                )
+            # Status and upstream headers are lost here: the 200 is already out.
+            stream_resp = early.response
+        else:
+            stream_resp = web.StreamResponse(status=r.status_code)
+            for name, value in r.headers.items():
+                if name.lower() in _STRIP_RESPONSE_HEADERS:
+                    continue
+                stream_resp.headers[name] = value
 
         head_buf = initial_stream_buf
         tail_buf = initial_stream_buf[-_TAIL_BUF_MAX:] if is_stream else b""
         resp_body_buf = b""
         try:
-            # Inside the try: prepare() is where a caller who already hung up
-            # surfaces, and ``r`` must be closed then too.
-            await stream_resp.prepare(request)
+            # Inside the try: prepare() or the first write is where a caller
+            # who already hung up surfaces, and ``r`` must be closed then too.
+            if not early.committed:
+                await stream_resp.prepare(request)
             if is_stream:
                 if initial_stream_buf:
                     await stream_resp.write(initial_stream_buf)
@@ -3419,6 +3624,7 @@ async def _proxy_attempts(
             await stream_resp.write_eof()
         except (ConnectionResetError, ConnectionError, Exception) as exc:
             logger.debug("write_eof ignored (client disconnected): %s", exc)
+        early.ended = True
 
         if tracker and model:
             if is_stream:
@@ -5339,6 +5545,7 @@ def create_app(
     strip_system_phrase: str = "",
     upgrade_cache_ttl: bool = True,
     precommit_timeout_seconds: float = 10.0,
+    early_commit_seconds: float = 60.0,
     oauth_smoke_enabled: bool = True,
     oauth_smoke_morning_window: str = "08:00-09:00",
     oauth_smoke_midday_window: str = "14:00-15:00",
@@ -5381,6 +5588,7 @@ def create_app(
     app["strip_system_phrase"] = strip_system_phrase
     app["upgrade_cache_ttl"] = upgrade_cache_ttl
     app["precommit_timeout"] = precommit_timeout_seconds
+    app["early_commit_seconds"] = early_commit_seconds
     app["dashboard_secret"] = dashboard_secret.strip()
     app["oauth_usage_require_auth"] = oauth_usage_require_auth
     app["oauth_usage_cache_seconds"] = oauth_usage_cache_seconds
@@ -5458,6 +5666,7 @@ def main() -> None:
         strip_system_phrase=settings.anthropic_proxy_strip_system_phrase,
         upgrade_cache_ttl=settings.anthropic_proxy_upgrade_cache_ttl,
         precommit_timeout_seconds=settings.anthropic_proxy_precommit_timeout_seconds,
+        early_commit_seconds=settings.anthropic_proxy_early_commit_seconds,
         oauth_smoke_enabled=settings.anthropic_oauth_smoke_enabled,
         oauth_smoke_morning_window=settings.anthropic_oauth_smoke_morning_window,
         oauth_smoke_midday_window=settings.anthropic_oauth_smoke_midday_window,

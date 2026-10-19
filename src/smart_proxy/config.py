@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # commit/error marker. On timeout it flushes and streams live (forwarding
     # Anthropic's keep-alive pings) so a Cloudflare edge doesn't 524. <=0 disables.
     anthropic_proxy_precommit_timeout_seconds: float = 10.0
+    # Seconds a streamed /v1/messages may wait on upstream headers before the
+    # proxy answers 200 itself and sends SSE keep-alive comments. Anthropic
+    # holds its headers until prefill ends, which on a large uncached prompt
+    # outlasts Cloudflare's 100-120s first-byte limit (524). <=0 disables.
+    anthropic_proxy_early_commit_seconds: float = 60.0
     # Auth is required by default: /_oauth_usage reports account ids and quota
     # state for every OAuth row, and the proxy binds 0.0.0.0.
     anthropic_oauth_usage_require_auth: bool = True
