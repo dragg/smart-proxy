@@ -33,7 +33,7 @@ _DEFAULT_BUILD_ID = "a35"
 # Floor the proxy claims until real Claude Code traffic teaches it a newer one.
 # Bump when Anthropic raises a gate and no CLI traffic is available to learn
 # from; `npm view @anthropic-ai/claude-code version` is the authoritative source.
-DEFAULT_CLAUDE_CODE_VERSION = "2.1.260"
+DEFAULT_CLAUDE_CODE_VERSION = "2.1.319"
 
 # The proxy presents itself as the SDK entrypoint, so the User-Agent and the
 # billing block must both say so — a `(external, cli)` UA paired with
