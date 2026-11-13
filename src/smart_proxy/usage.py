@@ -50,6 +50,8 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro":   (1.25, 10.00),
     "gemini-3-pro":     (1.25, 10.00),
     # Anthropic
+    "claude-fable-5-2":       (8.00, 40.00),
+    "claude-mythos-5-2":      (8.00, 40.00),
     "claude-fable-5-1":       (10.00, 50.00),
     "claude-mythos-5-1":      (10.00, 50.00),
     "claude-fable-5":         (10.00, 50.00),
@@ -88,9 +90,11 @@ _DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
 
 # Anthropic prompt caching prices:
 # (input, output, cache_read, cache_write_5m, cache_write_1h)
-# Cache reads are 0.1x input except Fable/Mythos 5.1 (0.025x) and
+# Cache reads are 0.1x input except Fable/Mythos 5.1 and 5.2 (0.025x) and
 # Opus/Sonnet 5.5 (0.05x).
 _DEFAULT_ANTHROPIC_CACHE_PRICES: dict[str, tuple[float, float, float, float, float]] = {
+    "claude-fable-5-2":  (8.00, 40.00, 0.20, 10.00, 16.00),
+    "claude-mythos-5-2": (8.00, 40.00, 0.20, 10.00, 16.00),
     "claude-fable-5-1":  (10.00, 50.00, 0.25, 12.50, 20.00),
     "claude-mythos-5-1": (10.00, 50.00, 0.25, 12.50, 20.00),
     "claude-fable-5":    (10.00, 50.00, 1.00, 12.50, 20.00),
