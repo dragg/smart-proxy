@@ -56,28 +56,31 @@ if os.environ.get("ANTHROPIC_PROXY_USAGE") == "true":
                     except:
                         return "?"
 
-                fh = usage["five_hour"]["utilization"]
-                fh_reset = fmt_reset(usage["five_hour"]["resets_at"])
-                sd = usage["seven_day"]["utilization"]
-                sd_reset = fmt_reset(usage["seven_day"]["resets_at"])
-                parts.append(f"5h: {round(fh)}% (↺ {fh_reset})")
-                parts.append(f"7d: {round(sd)}% (↺ {sd_reset})")
+                # A window is null when it has no activity yet (e.g. no requests
+                # in the current 5h window) -- show it as idle, keep the rest.
+                for label, win_key in (("5h", "five_hour"), ("7d", "seven_day")):
+                    win = usage.get(win_key)
+                    if not win or win.get("utilization") is None:
+                        parts.append(f"{label}: —")
+                        continue
+                    pct = round(win["utilization"])
+                    reset = fmt_reset(win["resets_at"]) if win.get("resets_at") else "?"
+                    parts.append(f"{label}: {pct}% (↺ {reset})")
 
                 for lim in usage.get("limits") or []:
                     kind = lim.get("kind")
+                    lim_reset = fmt_reset(lim["resets_at"]) if lim.get("resets_at") else "?"
                     if kind == "smartproxy_daily_usd":
                         pct = round(lim.get("percent") or 0)
                         spent = lim.get("spent_usd") or 0
                         cap = lim.get("limit_usd") or 0
-                        lim_reset = fmt_reset(lim["resets_at"])
                         parts.append(f"24h: {pct}% (${spent:.2f}/${cap:.2f} ↺ {lim_reset})")
                         continue
-                    if kind != "weekly_scoped":
+                    if kind != "weekly_scoped" or lim.get("percent") is None:
                         continue
                     scope = lim.get("scope") or {}
                     name = ((scope.get("model") or {}).get("display_name")
                             or scope.get("surface") or "scoped")
-                    lim_reset = fmt_reset(lim["resets_at"])
                     lim_pct = round(lim["percent"])
                     parts.append(f"{name} 7d: {lim_pct}% (↺ {lim_reset})")
             else:
